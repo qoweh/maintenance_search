@@ -1,0 +1,5 @@
+joblib
+numpy
+openpyxl
+scikit-learn
+pyinstaller

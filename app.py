@@ -1,0 +1,808 @@
+from __future__ import annotations
+
+import json
+import re
+import sqlite3
+import threading
+import traceback
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from queue import Empty, Queue
+from typing import Optional
+
+import joblib
+import numpy as np
+from openpyxl import load_workbook
+from sklearn.feature_extraction.text import TfidfVectorizer
+
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+
+
+TOKEN_RE = re.compile(r"[0-9A-Za-z가-힣]+")
+
+YEAR_RE = re.compile(r"(20\d{2})")
+FILE_RE = re.compile(r"(20\d{2})(0[1-9]|1[0-2])")
+
+APP_TITLE = "유지보수 사례 검색기"
+CACHE_DIR_NAME = ".maintenance_search_cache"
+CACHE_DB_NAME = "maintenance_cases.sqlite"
+CACHE_ARTIFACT_NAME = "search_artifacts.joblib"
+DEFAULT_TOP_N = 20
+DEFAULT_BM25_STAGE = 120
+
+
+@dataclass(slots=True)
+class MaintenanceCase:
+    case_id: int
+    source_file: str
+    source_sheet: str
+    row_num: int
+    year: int
+    month: int
+    date_text: str
+    department: str
+    user: str
+    issue_text: str
+    action_text: str
+    apc: str
+    pc_filter: str
+    utmp: str
+    sheet_title: str
+    search_text: str
+
+
+@dataclass(slots=True)
+class SearchFilters:
+    year_from: Optional[int] = None
+    year_to: Optional[int] = None
+    department: str = ""
+    user: str = ""
+    require_apc: bool = False
+    require_pc_filter: bool = False
+    require_utmp: bool = False
+
+
+class BM25Index:
+    def __init__(self, tokenized_docs: list[list[str]], k1: float = 1.5, b: float = 0.75) -> None:
+        self.k1 = k1
+        self.b = b
+        self.tokenized_docs = tokenized_docs
+        self.doc_len = np.array([len(doc) for doc in tokenized_docs], dtype=np.float32)
+        self.avgdl = float(self.doc_len.mean()) if len(self.doc_len) else 0.0
+        self.doc_freq: dict[str, int] = {}
+        for doc in tokenized_docs:
+            for term in set(doc):
+                self.doc_freq[term] = self.doc_freq.get(term, 0) + 1
+        self.idf: dict[str, float] = {}
+        n_docs = len(tokenized_docs)
+        for term, freq in self.doc_freq.items():
+            self.idf[term] = float(np.log(1.0 + (n_docs - freq + 0.5) / (freq + 0.5)))
+
+    def score(self, query_tokens: list[str]) -> np.ndarray:
+        if not self.tokenized_docs or not query_tokens:
+            return np.zeros(len(self.tokenized_docs), dtype=np.float32)
+
+        scores = np.zeros(len(self.tokenized_docs), dtype=np.float32)
+        for term in query_tokens:
+            if term not in self.idf:
+                continue
+            idf = self.idf[term]
+            for idx, doc in enumerate(self.tokenized_docs):
+                tf = 0
+                for token in doc:
+                    if token == term:
+                        tf += 1
+                if tf == 0:
+                    continue
+                denom = tf + self.k1 * (1.0 - self.b + self.b * (self.doc_len[idx] / self.avgdl if self.avgdl else 0.0))
+                scores[idx] += idf * (tf * (self.k1 + 1.0)) / denom
+        return scores
+
+
+@dataclass(slots=True)
+class SearchArtifacts:
+    records: list[MaintenanceCase]
+    vectorizer: TfidfVectorizer
+    tfidf_matrix: object
+    bm25: BM25Index
+    searchable_texts: list[str]
+    tokenized_texts: list[list[str]]
+    years: list[int]
+
+
+def normalize_text(value: object) -> str:
+    if value is None:
+        return ""
+    return str(value).replace("\u3000", " ").strip()
+
+
+def tokenize(text: str) -> list[str]:
+    return [token for token in TOKEN_RE.findall(text.lower()) if token.strip()]
+
+
+def parse_year_month_from_path(path: Path) -> tuple[int, int]:
+    for candidate in [path.stem, path.name, path.parent.name]:
+        match = FILE_RE.search(candidate)
+        if match:
+            return int(match.group(1)), int(match.group(2))
+        match = YEAR_RE.search(candidate)
+        if match:
+            return int(match.group(1)), 1
+    return 0, 0
+
+
+def safe_cell(value: object) -> str:
+    return normalize_text(value)
+
+
+class MaintenanceRepository:
+    def __init__(self, folder: Path) -> None:
+        self.folder = folder
+        self.cache_dir = folder / CACHE_DIR_NAME
+        self.db_path = self.cache_dir / CACHE_DB_NAME
+        self.artifact_path = self.cache_dir / CACHE_ARTIFACT_NAME
+
+    def ensure_cache_dir(self) -> None:
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+    def clear(self) -> None:
+        self.ensure_cache_dir()
+        if self.db_path.exists():
+            self.db_path.unlink()
+        if self.artifact_path.exists():
+            self.artifact_path.unlink()
+
+    def save_records(self, records: list[MaintenanceCase]) -> None:
+        self.ensure_cache_dir()
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS cases (
+                    case_id INTEGER PRIMARY KEY,
+                    source_file TEXT,
+                    source_sheet TEXT,
+                    row_num INTEGER,
+                    year INTEGER,
+                    month INTEGER,
+                    date_text TEXT,
+                    department TEXT,
+                    user TEXT,
+                    issue_text TEXT,
+                    action_text TEXT,
+                    apc TEXT,
+                    pc_filter TEXT,
+                    utmp TEXT,
+                    sheet_title TEXT,
+                    search_text TEXT
+                )
+                """
+            )
+            conn.execute("DELETE FROM cases")
+            conn.executemany(
+                """
+                INSERT INTO cases (
+                    case_id, source_file, source_sheet, row_num, year, month, date_text,
+                    department, user, issue_text, action_text, apc, pc_filter, utmp,
+                    sheet_title, search_text
+                ) VALUES (
+                    :case_id, :source_file, :source_sheet, :row_num, :year, :month, :date_text,
+                    :department, :user, :issue_text, :action_text, :apc, :pc_filter, :utmp,
+                    :sheet_title, :search_text
+                )
+                """,
+                [asdict(record) for record in records],
+            )
+            conn.commit()
+
+    def load_records(self) -> list[MaintenanceCase]:
+        if not self.db_path.exists():
+            return []
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute("SELECT * FROM cases ORDER BY case_id").fetchall()
+        return [MaintenanceCase(**dict(row)) for row in rows]
+
+    def save_artifacts(self, artifacts: SearchArtifacts) -> None:
+        self.ensure_cache_dir()
+        joblib.dump(
+            {
+                "records": artifacts.records,
+                "vectorizer": artifacts.vectorizer,
+                "tfidf_matrix": artifacts.tfidf_matrix,
+                "bm25": artifacts.bm25,
+                "searchable_texts": artifacts.searchable_texts,
+                "tokenized_texts": artifacts.tokenized_texts,
+                "years": artifacts.years,
+            },
+            self.artifact_path,
+        )
+
+    def load_artifacts(self) -> Optional[SearchArtifacts]:
+        if not self.artifact_path.exists():
+            return None
+        payload = joblib.load(self.artifact_path)
+        return SearchArtifacts(
+            records=payload["records"],
+            vectorizer=payload["vectorizer"],
+            tfidf_matrix=payload["tfidf_matrix"],
+            bm25=payload["bm25"],
+            searchable_texts=payload["searchable_texts"],
+            tokenized_texts=payload["tokenized_texts"],
+            years=payload["years"],
+        )
+
+
+class MaintenanceSearchEngine:
+    def __init__(self) -> None:
+        self.repository: Optional[MaintenanceRepository] = None
+        self.artifacts: Optional[SearchArtifacts] = None
+        self.records: list[MaintenanceCase] = []
+        self.loaded_folder: Optional[Path] = None
+
+    @property
+    def is_ready(self) -> bool:
+        return self.artifacts is not None and bool(self.records)
+
+    def load_folder(self, folder: Path) -> bool:
+        self.repository = MaintenanceRepository(folder)
+        artifacts = self.repository.load_artifacts()
+        if artifacts is None:
+            return False
+        self.artifacts = artifacts
+        self.records = artifacts.records
+        self.loaded_folder = folder
+        return True
+
+    def build_from_folder(self, folder: Path) -> tuple[int, list[int]]:
+        repository = MaintenanceRepository(folder)
+        repository.clear()
+        records = self._collect_cases(folder)
+        if not records:
+            raise RuntimeError("엑셀 파일에서 유효한 장애 사례를 찾지 못했습니다.")
+
+        searchable_texts = [record.search_text for record in records]
+        tokenized_texts = [tokenize(text) for text in searchable_texts]
+
+        vectorizer = TfidfVectorizer(
+            tokenizer=tokenize,
+            preprocessor=None,
+            lowercase=False,
+            token_pattern=None,
+            min_df=1,
+        )
+        tfidf_matrix = vectorizer.fit_transform(searchable_texts)
+        bm25 = BM25Index(tokenized_texts)
+        years = sorted({record.year for record in records if record.year})
+
+        artifacts = SearchArtifacts(
+            records=records,
+            vectorizer=vectorizer,
+            tfidf_matrix=tfidf_matrix,
+            bm25=bm25,
+            searchable_texts=searchable_texts,
+            tokenized_texts=tokenized_texts,
+            years=years,
+        )
+        repository.save_records(records)
+        repository.save_artifacts(artifacts)
+        self.repository = repository
+        self.artifacts = artifacts
+        self.records = records
+        self.loaded_folder = folder
+        return len(records), years
+
+    def _collect_cases(self, folder: Path) -> list[MaintenanceCase]:
+        records: list[MaintenanceCase] = []
+        case_id = 1
+
+        for xlsx_path in sorted(folder.rglob("*.xlsx")):
+            if xlsx_path.name.startswith("~$"):
+                continue
+            year, month = parse_year_month_from_path(xlsx_path)
+            workbook = load_workbook(xlsx_path, data_only=True)
+            sheet = workbook[workbook.sheetnames[0]]
+            sheet_title = safe_cell(sheet.cell(1, 1).value)
+            source_sheet = safe_cell(sheet.title)
+            last_date = ""
+
+            for row_num in range(5, sheet.max_row + 1):
+                row_values = [sheet.cell(row_num, col).value for col in range(1, 10)]
+                if not any(value not in (None, "") for value in row_values):
+                    continue
+
+                seq = row_values[0]
+                date_value = safe_cell(row_values[1])
+                if date_value:
+                    last_date = date_value
+                date_text = date_value or last_date
+                department = safe_cell(row_values[2])
+                user = safe_cell(row_values[3])
+                issue_text = safe_cell(row_values[4])
+                action_text = safe_cell(row_values[5])
+                apc = safe_cell(row_values[6])
+                pc_filter = safe_cell(row_values[7])
+                utmp = safe_cell(row_values[8])
+
+                if not any([issue_text, action_text, department, user, date_text, seq]):
+                    continue
+
+                searchable_text = " ".join(
+                    part
+                    for part in [
+                        issue_text,
+                        action_text,
+                        department,
+                        user,
+                        date_text,
+                        sheet_title,
+                        xlsx_path.stem,
+                    ]
+                    if part
+                )
+
+                records.append(
+                    MaintenanceCase(
+                        case_id=case_id,
+                        source_file=xlsx_path.name,
+                        source_sheet=source_sheet,
+                        row_num=row_num,
+                        year=year,
+                        month=month,
+                        date_text=date_text,
+                        department=department,
+                        user=user,
+                        issue_text=issue_text,
+                        action_text=action_text,
+                        apc=apc,
+                        pc_filter=pc_filter,
+                        utmp=utmp,
+                        sheet_title=sheet_title,
+                        search_text=searchable_text,
+                    )
+                )
+                case_id += 1
+
+        return records
+
+    def _apply_filters(self, filters: SearchFilters) -> list[int]:
+        indices: list[int] = []
+        department_term = filters.department.strip().lower()
+        user_term = filters.user.strip().lower()
+
+        for idx, record in enumerate(self.records):
+            if filters.year_from is not None and record.year and record.year < filters.year_from:
+                continue
+            if filters.year_to is not None and record.year and record.year > filters.year_to:
+                continue
+            if department_term and department_term not in record.department.lower():
+                continue
+            if user_term and user_term not in record.user.lower():
+                continue
+            if filters.require_apc and record.apc != "O":
+                continue
+            if filters.require_pc_filter and record.pc_filter != "O":
+                continue
+            if filters.require_utmp and record.utmp != "O":
+                continue
+            indices.append(idx)
+        return indices
+
+    def search(
+        self,
+        query: str,
+        filters: SearchFilters,
+        top_n: int = DEFAULT_TOP_N,
+        bm25_stage: int = DEFAULT_BM25_STAGE,
+    ) -> list[dict[str, object]]:
+        if not self.is_ready or self.artifacts is None:
+            raise RuntimeError("검색 인덱스가 아직 준비되지 않았습니다.")
+
+        query = query.strip()
+        if not query:
+            return []
+
+        candidate_indices = self._apply_filters(filters)
+        if not candidate_indices:
+            return []
+
+        query_tokens = tokenize(query)
+        bm25_scores = self.artifacts.bm25.score(query_tokens)
+        candidate_scores = bm25_scores[candidate_indices]
+        stage1_count = min(max(bm25_stage, top_n), len(candidate_indices))
+        stage1_rel_indices = np.argsort(-candidate_scores)[:stage1_count]
+        stage1_indices = [candidate_indices[i] for i in stage1_rel_indices]
+
+        query_vector = self.artifacts.vectorizer.transform([query])
+        stage1_matrix = self.artifacts.tfidf_matrix[stage1_indices]
+        vector_scores = np.asarray(stage1_matrix.dot(query_vector.T).toarray()).ravel()
+        bm25_stage_scores = candidate_scores[stage1_rel_indices]
+
+        bm25_norm = self._normalize_scores(bm25_stage_scores)
+        vec_norm = self._normalize_scores(vector_scores)
+        final_scores = (0.45 * bm25_norm) + (0.55 * vec_norm)
+        positive_indices = np.where(final_scores > 1e-8)[0]
+        if positive_indices.size == 0:
+            return []
+
+        ranked = positive_indices[np.argsort(-final_scores[positive_indices])][:top_n]
+        results: list[dict[str, object]] = []
+        for rank, rel_idx in enumerate(ranked, start=1):
+            case = self.records[stage1_indices[rel_idx]]
+            results.append(
+                {
+                    "rank": rank,
+                    "score": float(final_scores[rel_idx]),
+                    "bm25": float(bm25_stage_scores[rel_idx]),
+                    "vector": float(vector_scores[rel_idx]),
+                    "case": case,
+                }
+            )
+        return results
+
+    @staticmethod
+    def _normalize_scores(values: np.ndarray) -> np.ndarray:
+        if values.size == 0:
+            return values.astype(np.float32)
+        max_value = float(values.max())
+        min_value = float(values.min())
+        if np.isclose(max_value, min_value):
+            return np.zeros_like(values, dtype=np.float32)
+        return ((values - min_value) / (max_value - min_value)).astype(np.float32)
+
+
+class MaintenanceSearchApp:
+    def __init__(self, root: tk.Tk) -> None:
+        self.root = root
+        self.root.title(APP_TITLE)
+        self.root.geometry("1400x860")
+        self.root.minsize(1200, 760)
+
+        self.engine = MaintenanceSearchEngine()
+        self.queue: Queue[tuple[str, object]] = Queue()
+        self.search_results: list[dict[str, object]] = []
+        self.year_values: list[int] = []
+        self._build_busy = False
+
+        self.folder_var = tk.StringVar(value=str(Path.cwd() / "유지보수내역서 25.01~26.04"))
+        self.query_var = tk.StringVar()
+        self.top_n_var = tk.IntVar(value=20)
+        self.year_from_var = tk.StringVar(value="전체")
+        self.year_to_var = tk.StringVar(value="전체")
+        self.department_var = tk.StringVar()
+        self.user_var = tk.StringVar()
+        self.apc_var = tk.BooleanVar(value=False)
+        self.pc_filter_var = tk.BooleanVar(value=False)
+        self.utmp_var = tk.BooleanVar(value=False)
+        self.status_var = tk.StringVar(value="인덱스를 불러오거나 새로 구축하세요.")
+
+        self._build_ui()
+        self._try_load_existing_index()
+
+    def _build_ui(self) -> None:
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(1, weight=1)
+
+        top = ttk.Frame(self.root, padding=10)
+        top.grid(row=0, column=0, sticky="ew")
+        top.columnconfigure(1, weight=1)
+
+        ttk.Label(top, text="데이터 폴더").grid(row=0, column=0, sticky="w")
+        folder_entry = ttk.Entry(top, textvariable=self.folder_var)
+        folder_entry.grid(row=0, column=1, sticky="ew", padx=(8, 8))
+        ttk.Button(top, text="찾기", command=self._browse_folder).grid(row=0, column=2, padx=(0, 6))
+        ttk.Button(top, text="인덱스 구축", command=self._start_build).grid(row=0, column=3, padx=(0, 6))
+        ttk.Button(top, text="인덱스 불러오기", command=self._load_index).grid(row=0, column=4)
+
+        search = ttk.LabelFrame(self.root, text="검색", padding=10)
+        search.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 10))
+        search.columnconfigure(1, weight=1)
+        search.rowconfigure(2, weight=1)
+
+        ttk.Label(search, text="장애내용 / 조치내용").grid(row=0, column=0, sticky="w")
+        query_entry = ttk.Entry(search, textvariable=self.query_var)
+        query_entry.grid(row=0, column=1, sticky="ew", padx=(8, 8))
+        query_entry.bind("<Return>", lambda _: self._run_search())
+        ttk.Label(search, text="결과 수").grid(row=0, column=2, sticky="e")
+        ttk.Spinbox(search, from_=5, to=100, textvariable=self.top_n_var, width=6).grid(row=0, column=3, sticky="w", padx=(8, 0))
+        ttk.Button(search, text="검색", command=self._run_search).grid(row=0, column=4, padx=(10, 0))
+
+        filter_frame = ttk.Frame(search)
+        filter_frame.grid(row=1, column=0, columnspan=5, sticky="ew", pady=(10, 8))
+        for col in range(10):
+            filter_frame.columnconfigure(col, weight=1 if col in (1, 4, 6, 8) else 0)
+
+        ttk.Label(filter_frame, text="연도 from").grid(row=0, column=0, sticky="w")
+        self.year_from_combo = ttk.Combobox(filter_frame, textvariable=self.year_from_var, values=["전체"], width=10, state="readonly")
+        self.year_from_combo.grid(row=0, column=1, sticky="w", padx=(6, 12))
+
+        ttk.Label(filter_frame, text="연도 to").grid(row=0, column=2, sticky="w")
+        self.year_to_combo = ttk.Combobox(filter_frame, textvariable=self.year_to_var, values=["전체"], width=10, state="readonly")
+        self.year_to_combo.grid(row=0, column=3, sticky="w", padx=(6, 12))
+
+        ttk.Label(filter_frame, text="부서 포함").grid(row=0, column=4, sticky="w")
+        ttk.Entry(filter_frame, textvariable=self.department_var, width=20).grid(row=0, column=5, sticky="w", padx=(6, 12))
+
+        ttk.Label(filter_frame, text="사용자 포함").grid(row=0, column=6, sticky="w")
+        ttk.Entry(filter_frame, textvariable=self.user_var, width=20).grid(row=0, column=7, sticky="w", padx=(6, 12))
+
+        flags = ttk.Frame(filter_frame)
+        flags.grid(row=0, column=8, columnspan=2, sticky="w")
+        ttk.Checkbutton(flags, text="APC", variable=self.apc_var).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Checkbutton(flags, text="PC filter", variable=self.pc_filter_var).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Checkbutton(flags, text="UTMP", variable=self.utmp_var).pack(side=tk.LEFT)
+
+        body = ttk.Panedwindow(self.root, orient=tk.VERTICAL)
+        body.grid(row=2, column=0, sticky="nsew", padx=10, pady=(0, 10))
+        self.root.rowconfigure(2, weight=1)
+
+        results_frame = ttk.Labelframe(body, text="유사 사례 목록", padding=6)
+        detail_frame = ttk.Labelframe(body, text="선택 항목 상세", padding=6)
+        body.add(results_frame, weight=3)
+        body.add(detail_frame, weight=2)
+
+        results_frame.rowconfigure(0, weight=1)
+        results_frame.columnconfigure(0, weight=1)
+        columns = ("rank", "score", "bm25", "vector", "year", "date", "dept", "user", "issue", "action", "file")
+        self.tree = ttk.Treeview(results_frame, columns=columns, show="headings", height=16)
+        headings = {
+            "rank": "순위",
+            "score": "종합",
+            "bm25": "BM25",
+            "vector": "벡터",
+            "year": "연도",
+            "date": "날짜",
+            "dept": "부서",
+            "user": "사용자",
+            "issue": "장애내용",
+            "action": "조치내용",
+            "file": "원본파일",
+        }
+        widths = {
+            "rank": 60,
+            "score": 80,
+            "bm25": 80,
+            "vector": 80,
+            "year": 70,
+            "date": 100,
+            "dept": 180,
+            "user": 120,
+            "issue": 260,
+            "action": 320,
+            "file": 180,
+        }
+        for col in columns:
+            self.tree.heading(col, text=headings[col])
+            self.tree.column(col, width=widths[col], anchor="w")
+        vsb = ttk.Scrollbar(results_frame, orient=tk.VERTICAL, command=self.tree.yview)
+        hsb = ttk.Scrollbar(results_frame, orient=tk.HORIZONTAL, command=self.tree.xview)
+        self.tree.configure(yscroll=vsb.set, xscroll=hsb.set)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+        self.tree.bind("<<TreeviewSelect>>", self._show_selected_detail)
+
+        detail_frame.rowconfigure(0, weight=1)
+        detail_frame.columnconfigure(0, weight=1)
+        self.detail_text = tk.Text(detail_frame, wrap="word", height=12)
+        self.detail_text.grid(row=0, column=0, sticky="nsew")
+        detail_scroll = ttk.Scrollbar(detail_frame, orient=tk.VERTICAL, command=self.detail_text.yview)
+        self.detail_text.configure(yscrollcommand=detail_scroll.set)
+        detail_scroll.grid(row=0, column=1, sticky="ns")
+
+        bottom = ttk.Frame(self.root, padding=(10, 0, 10, 10))
+        bottom.grid(row=3, column=0, sticky="ew")
+        bottom.columnconfigure(0, weight=1)
+        self.progress = ttk.Progressbar(bottom, mode="indeterminate")
+        self.progress.grid(row=0, column=0, sticky="ew", padx=(0, 10))
+        ttk.Label(bottom, textvariable=self.status_var).grid(row=1, column=0, sticky="w", pady=(6, 0))
+
+    def _browse_folder(self) -> None:
+        selected = filedialog.askdirectory(title="유지보수 엑셀 폴더 선택", initialdir=self.folder_var.get() or str(Path.cwd()))
+        if selected:
+            self.folder_var.set(selected)
+            self.status_var.set(f"폴더 선택 완료: {selected}")
+            self._load_index()
+
+    def _start_build(self) -> None:
+        folder = Path(self.folder_var.get()).expanduser()
+        if not folder.exists():
+            messagebox.showerror(APP_TITLE, "데이터 폴더를 찾을 수 없습니다.")
+            return
+        self._set_busy(True)
+        self._build_busy = True
+        self.status_var.set("인덱스를 구축 중입니다. 잠시만 기다려 주세요.")
+        threading.Thread(target=self._build_worker, args=(folder,), daemon=True).start()
+        self.root.after(100, self._poll_queue)
+
+    def _build_worker(self, folder: Path) -> None:
+        try:
+            count, years = self.engine.build_from_folder(folder)
+            self.queue.put(("build_done", (count, years, folder)))
+        except Exception as exc:
+            self.queue.put(("error", (exc, traceback.format_exc())))
+
+    def _load_index(self) -> None:
+        folder = Path(self.folder_var.get()).expanduser()
+        if not folder.exists():
+            self.status_var.set("데이터 폴더가 없습니다.")
+            return
+        try:
+            if self.engine.load_folder(folder):
+                self.year_values = self.engine.artifacts.years if self.engine.artifacts else []
+                self._refresh_year_combos()
+                self.status_var.set(f"인덱스 로드 완료: {len(self.engine.records)}건")
+            else:
+                self.status_var.set("저장된 인덱스가 없습니다. 인덱스 구축을 실행하세요.")
+        except Exception as exc:
+            messagebox.showerror(APP_TITLE, f"인덱스 로드 실패\n\n{exc}")
+
+    def _try_load_existing_index(self) -> None:
+        self._load_index()
+
+    def _poll_queue(self) -> None:
+        try:
+            kind, payload = self.queue.get_nowait()
+        except Empty:
+            if self._build_busy:
+                self.root.after(100, self._poll_queue)
+            return
+
+        if kind == "build_done":
+            count, years, folder = payload
+            self.year_values = years
+            self._refresh_year_combos()
+            self.status_var.set(f"인덱스 구축 완료: {count}건 / 폴더: {folder}")
+            messagebox.showinfo(APP_TITLE, f"인덱스 구축 완료\n총 {count}건의 사례를 저장했습니다.")
+        elif kind == "error":
+            exc, tb = payload
+            messagebox.showerror(APP_TITLE, f"작업 중 오류가 발생했습니다.\n\n{exc}\n\n{tb}")
+            self.status_var.set("오류가 발생했습니다.")
+        self._build_busy = False
+        self._set_busy(False)
+
+    def _set_busy(self, busy: bool) -> None:
+        if busy:
+            self.progress.start(10)
+        else:
+            self.progress.stop()
+        state = ["disabled"] if busy else ["!disabled"]
+        for child in self.root.winfo_children():
+            self._set_state_recursive(child, state)
+        # keep bottom bar usable
+        self.progress.configure(mode="indeterminate")
+
+    def _set_state_recursive(self, widget: tk.Widget, state: list[str]) -> None:
+        try:
+            if isinstance(widget, (ttk.Entry, ttk.Button, ttk.Combobox, ttk.Checkbutton, ttk.Spinbox)):
+                widget.state(state)
+        except Exception:
+            pass
+        for child in widget.winfo_children():
+            self._set_state_recursive(child, state)
+
+    def _refresh_year_combos(self) -> None:
+        values = ["전체"] + [str(year) for year in self.year_values]
+        self.year_from_combo.configure(values=values)
+        self.year_to_combo.configure(values=values)
+        if self.year_from_var.get() not in values:
+            self.year_from_var.set("전체")
+        if self.year_to_var.get() not in values:
+            self.year_to_var.set("전체")
+
+    def _collect_filters(self) -> SearchFilters:
+        def parse_year(value: str) -> Optional[int]:
+            value = value.strip()
+            if not value or value == "전체":
+                return None
+            try:
+                return int(value)
+            except ValueError:
+                return None
+
+        return SearchFilters(
+            year_from=parse_year(self.year_from_var.get()),
+            year_to=parse_year(self.year_to_var.get()),
+            department=self.department_var.get(),
+            user=self.user_var.get(),
+            require_apc=self.apc_var.get(),
+            require_pc_filter=self.pc_filter_var.get(),
+            require_utmp=self.utmp_var.get(),
+        )
+
+    def _run_search(self) -> None:
+        if not self.engine.is_ready:
+            messagebox.showwarning(APP_TITLE, "먼저 인덱스를 구축하거나 불러오세요.")
+            return
+        query = self.query_var.get().strip()
+        if not query:
+            messagebox.showwarning(APP_TITLE, "검색어를 입력하세요.")
+            return
+
+        try:
+            filters = self._collect_filters()
+            results = self.engine.search(query, filters, top_n=self.top_n_var.get())
+            self._show_results(results)
+            self.status_var.set(f"검색 완료: {len(results)}건")
+        except Exception as exc:
+            messagebox.showerror(APP_TITLE, f"검색 실패\n\n{exc}")
+
+    def _show_results(self, results: list[dict[str, object]]) -> None:
+        self.search_results = results
+        self.tree.delete(*self.tree.get_children())
+        self.detail_text.delete("1.0", tk.END)
+        if not results:
+            self.detail_text.insert(tk.END, "검색 결과가 없습니다.")
+            return
+
+        for result in results:
+            case: MaintenanceCase = result["case"]
+            self.tree.insert(
+                "",
+                tk.END,
+                values=(
+                    result["rank"],
+                    f"{result['score']:.3f}",
+                    f"{result['bm25']:.3f}",
+                    f"{result['vector']:.3f}",
+                    case.year,
+                    case.date_text,
+                    case.department,
+                    case.user,
+                    self._shorten(case.issue_text, 28),
+                    self._shorten(case.action_text, 40),
+                    case.source_file,
+                ),
+            )
+        self.tree.selection_set(self.tree.get_children()[0])
+        self.tree.focus(self.tree.get_children()[0])
+        self._show_selected_detail()
+
+    def _shorten(self, text: str, limit: int) -> str:
+        return text if len(text) <= limit else text[: limit - 1] + "…"
+
+    def _show_selected_detail(self, event: object | None = None) -> None:
+        selection = self.tree.selection()
+        if not selection:
+            return
+        idx = self.tree.index(selection[0])
+        if idx >= len(self.search_results):
+            return
+        result = self.search_results[idx]
+        case: MaintenanceCase = result["case"]
+        detail = {
+            "순위": result["rank"],
+            "종합점수": round(float(result["score"]), 4),
+            "BM25": round(float(result["bm25"]), 4),
+            "벡터": round(float(result["vector"]), 4),
+            "연도": case.year,
+            "월": case.month,
+            "날짜": case.date_text,
+            "부서": case.department,
+            "사용자": case.user,
+            "장애내용": case.issue_text,
+            "조치내용": case.action_text,
+            "APC": case.apc,
+            "PC filter": case.pc_filter,
+            "UTMP": case.utmp,
+            "원본파일": case.source_file,
+            "시트": case.source_sheet,
+            "행번호": case.row_num,
+            "시트제목": case.sheet_title,
+        }
+        self.detail_text.delete("1.0", tk.END)
+        self.detail_text.insert(tk.END, json.dumps(detail, ensure_ascii=False, indent=2))
+
+
+def main() -> None:
+    root = tk.Tk()
+    try:
+        ttk.Style().theme_use("clam")
+    except Exception:
+        pass
+    MaintenanceSearchApp(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
