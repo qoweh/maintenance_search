@@ -871,7 +871,7 @@ class MaintenanceSearchApp:
         action_row.grid(row=1, column=0, sticky="ew", pady=(8, 0))
         ttk.Label(action_row, text="결과 수").pack(side=tk.LEFT)
         ttk.Spinbox(action_row, from_=5, to=100, textvariable=self.top_n_var, width=6).pack(side=tk.LEFT, padx=(8, 12))
-        actions = ttk.Frame(search)
+        actions = ttk.Frame(action_row)
         actions.pack(side=tk.LEFT)
         ttk.Button(actions, text="검색", command=self._run_search).pack(side=tk.LEFT)
         ttk.Button(actions, text="전체 보기", command=self._show_all_cases).pack(side=tk.LEFT, padx=(6, 0))
