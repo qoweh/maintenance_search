@@ -8,11 +8,12 @@ import subprocess
 import sys
 import threading
 import traceback
+from copy import copy
 from collections import Counter
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from queue import Empty, Queue
-from typing import Optional
+from typing import Callable, Optional
 
 import joblib
 import numpy as np
@@ -34,7 +35,7 @@ CACHE_DB_NAME = "maintenance_cases.sqlite"
 CACHE_ARTIFACT_NAME = "search_artifacts.joblib"
 CACHE_REPORT_NAME = "index_report.json"
 DEFAULT_TOP_N = 20
-SEARCH_INDEX_VERSION = 4
+SEARCH_INDEX_VERSION = 5
 MANIFEST_CHECK_INTERVAL_MS = 30_000
 QUERY_HINT = "장애, 조치, 부서, 사용자, 날짜 등을 입력하세요"
 EXCLUDE_FILE_KEYWORDS = (
@@ -51,10 +52,12 @@ CHECKED_VALUES = {"O", "Y", "YES", "TRUE", "1", "○", "예"}
 
 @dataclass(slots=True)
 class MaintenanceCase:
+    # 원본 Excel 행 위치와 주요 값을 함께 들고 있어 검색 결과에서 바로 원본 확인/수정이 가능하다.
     case_id: int
     source_file: str
     source_sheet: str
     row_num: int
+    sequence_number: str
     year: int
     month: int
     date_text: str
@@ -83,6 +86,7 @@ class SearchFilters:
 
 
 class BM25Index:
+    # 짧은 장애 문장에서는 단어 일치가 직관적이어서 TF-IDF와 함께 BM25 점수를 사용한다.
     def __init__(self, tokenized_docs: list[list[str]], k1: float = 1.5, b: float = 0.75) -> None:
         self.k1 = k1
         self.b = b
@@ -304,6 +308,7 @@ def add_report_detail(
 
 
 class MaintenanceRepository:
+    # SQLite와 joblib 캐시는 선택한 데이터 폴더 아래에만 저장해 배포 파일과 원본 데이터를 분리한다.
     def __init__(self, folder: Path) -> None:
         self.folder = folder
         self.cache_dir = folder / CACHE_DIR_NAME
@@ -333,6 +338,7 @@ class MaintenanceRepository:
                     source_file TEXT,
                     source_sheet TEXT,
                     row_num INTEGER,
+                    sequence_number TEXT,
                     year INTEGER,
                     month INTEGER,
                     date_text TEXT,
@@ -352,11 +358,11 @@ class MaintenanceRepository:
             conn.executemany(
                 """
                 INSERT INTO cases (
-                    case_id, source_file, source_sheet, row_num, year, month, date_text,
+                    case_id, source_file, source_sheet, row_num, sequence_number, year, month, date_text,
                     department, user, issue_text, action_text, apc, pc_filter, utmp,
                     sheet_title, search_text
                 ) VALUES (
-                    :case_id, :source_file, :source_sheet, :row_num, :year, :month, :date_text,
+                    :case_id, :source_file, :source_sheet, :row_num, :sequence_number, :year, :month, :date_text,
                     :department, :user, :issue_text, :action_text, :apc, :pc_filter, :utmp,
                     :sheet_title, :search_text
                 )
@@ -419,6 +425,7 @@ class MaintenanceRepository:
 
 
 class MaintenanceSearchEngine:
+    # 폴더의 Excel 파일을 읽어 검색 인덱스를 만들고, 캐시가 오래되었는지 판단한다.
     def __init__(self) -> None:
         self.repository: Optional[MaintenanceRepository] = None
         self.artifacts: Optional[SearchArtifacts] = None
@@ -547,6 +554,7 @@ class MaintenanceSearchEngine:
                         report["total_rows"] = int(report["total_rows"]) + 1
                         row_values = tuple(row_values) + (None,) * (9 - len(row_values))
 
+                        sequence_number = safe_cell(row_values[0])
                         date_value = safe_cell(row_values[1])
                         if date_value:
                             last_date = date_value
@@ -685,6 +693,7 @@ class MaintenanceSearchEngine:
                                 source_file=xlsx_path.name,
                                 source_sheet=source_sheet,
                                 row_num=row_num,
+                                sequence_number=sequence_number,
                                 year=year,
                                 month=month,
                                 date_text=date_text,
@@ -862,6 +871,7 @@ class MaintenanceSearchEngine:
 
 
 class MaintenanceSearchApp:
+    # Tkinter 화면과 사용자 동작을 담당한다. 실제 검색/캐시는 MaintenanceSearchEngine에 위임한다.
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title(APP_TITLE)
@@ -930,9 +940,10 @@ class MaintenanceSearchApp:
         ttk.Button(top, text="찾기", command=self._browse_folder).grid(row=0, column=2, padx=(0, 6))
         self.build_button = ttk.Button(top, text="인덱스 구축", command=self._prepare_index)
         self.build_button.grid(row=0, column=3, padx=(0, 6))
-        ttk.Button(top, text="인덱스 리포트 보기", command=self._show_index_report).grid(row=0, column=4)
+        ttk.Button(top, text="인덱스 리포트 보기", command=self._show_index_report).grid(row=0, column=4, padx=(0, 6))
+        ttk.Button(top, text="새 내역 추가", command=self._show_add_case_dialog).grid(row=0, column=5)
         ttk.Label(top, textvariable=self.index_notice_var, style="Warning.TLabel").grid(
-            row=1, column=1, columnspan=4, sticky="w", padx=(8, 0), pady=(6, 0)
+            row=1, column=1, columnspan=5, sticky="w", padx=(8, 0), pady=(6, 0)
         )
 
         search = ttk.LabelFrame(self.root, text="검색", padding=10)
@@ -1133,6 +1144,10 @@ class MaintenanceSearchApp:
             lambda event: self.detail_source_label.configure(wraplength=max(300, event.width - 24)),
             add="+",
         )
+        detail_actions = ttk.Frame(detail_frame)
+        detail_actions.grid(row=3, column=0, sticky="e", pady=(8, 0))
+        ttk.Button(detail_actions, text="원본 열기", command=self._open_selected_case_source).pack(side=tk.LEFT)
+        ttk.Button(detail_actions, text="선택 항목 수정", command=self._show_edit_case_dialog).pack(side=tk.LEFT, padx=(6, 0))
         self._set_detail_empty_message("검색 결과에서 사례를 선택하면 상세 내용이 표시됩니다.")
 
         bottom = ttk.Frame(self.root, padding=(10, 0, 10, 10))
@@ -1547,13 +1562,17 @@ class MaintenanceSearchApp:
 
         sheet_name = str(detail.get("sheet") or "")
         row_num = detail.get("row")
+        self._open_excel_file_location(path, sheet_name, row_num)
+
+    # 원본 위치 열기는 Windows Excel COM이 가능하면 행까지 이동하고, 실패하면 파일 열기로 대체한다.
+    def _open_excel_file_location(self, path: Path, sheet_name: str = "", row_num: object = None) -> None:
         if sys.platform == "win32" and sheet_name and row_num:
             try:
                 import win32com.client  # type: ignore[import-not-found]
 
                 excel = win32com.client.Dispatch("Excel.Application")
                 excel.Visible = True
-                workbook = excel.Workbooks.Open(str(path))
+                workbook = excel.Workbooks.Open(str(path.resolve()))
                 worksheet = workbook.Worksheets(sheet_name)
                 worksheet.Activate()
                 worksheet.Rows(int(row_num)).Select()
@@ -1570,6 +1589,415 @@ class MaintenanceSearchApp:
                 subprocess.Popen(["xdg-open", str(path)])
         except Exception as exc:
             messagebox.showerror(APP_TITLE, f"원본 파일 열기 실패\n\n{exc}")
+
+    # 검색 결과의 원본 Excel 행을 직접 열거나 수정하는 기능 묶음.
+    def _get_selected_case(self) -> Optional[MaintenanceCase]:
+        selection = self.tree.selection()
+        if not selection:
+            messagebox.showwarning(APP_TITLE, "먼저 검색 결과에서 항목을 선택하세요.")
+            return None
+        idx = self.tree.index(selection[0])
+        if idx >= len(self.search_results):
+            messagebox.showwarning(APP_TITLE, "선택한 항목을 찾을 수 없습니다.")
+            return None
+        return self.search_results[idx]["case"]
+
+    def _resolve_case_path(self, case: MaintenanceCase) -> Optional[Path]:
+        base = self.engine.loaded_folder or Path(self.folder_var.get()).expanduser()
+        source = Path(case.source_file)
+        candidates: list[Path] = []
+        if source.is_absolute():
+            candidates.append(source)
+        else:
+            candidates.append(base / source)
+            if base.exists():
+                candidates.extend(sorted(base.rglob(source.name)))
+
+        for candidate in candidates:
+            if candidate.exists() and candidate.is_file():
+                year, month = parse_year_month_from_path(candidate)
+                if case.year and case.month and (year, month) == (case.year, case.month):
+                    return candidate
+        for candidate in candidates:
+            if candidate.exists() and candidate.is_file():
+                return candidate
+        return None
+
+    def _open_selected_case_source(self) -> None:
+        case = self._get_selected_case()
+        if case is None:
+            return
+        path = self._resolve_case_path(case)
+        if path is None:
+            messagebox.showwarning(APP_TITLE, f"원본 파일을 찾을 수 없습니다.\n\n{case.source_file}")
+            return
+        self._open_excel_file_location(path, case.source_sheet, case.row_num)
+
+    def _show_add_case_dialog(self) -> None:
+        folder = Path(self.folder_var.get()).expanduser()
+        if not folder.exists():
+            messagebox.showwarning(APP_TITLE, "먼저 데이터 폴더를 선택하세요.")
+            return
+        month_values = self._get_available_source_months()
+        if not month_values:
+            messagebox.showwarning(APP_TITLE, "유지보수 엑셀 파일을 찾을 수 없습니다.")
+            return
+        initial_month = month_values[-1]
+        self._show_case_editor(
+            title="새 내역 추가",
+            initial={
+                "sequence": self._get_next_sequence_for_month(initial_month),
+                "date": "",
+                "department": "",
+                "user": "",
+                "issue": "",
+                "action": "",
+                "apc": True,
+                "pc_filter": True,
+                "utmp": True,
+            },
+            month_values=month_values,
+            initial_month=initial_month,
+            on_save=lambda values, month: self._save_new_case(month, values),
+        )
+
+    def _show_edit_case_dialog(self) -> None:
+        case = self._get_selected_case()
+        if case is None:
+            return
+        self._show_case_editor(
+            title="선택 항목 수정",
+            initial={
+                "sequence": case.sequence_number,
+                "date": case.date_text,
+                "department": case.department,
+                "user": case.user,
+                "issue": case.issue_text,
+                "action": case.action_text,
+                "apc": is_checked(case.apc),
+                "pc_filter": is_checked(case.pc_filter),
+                "utmp": is_checked(case.utmp),
+            },
+            source_text=f"{case.source_file} / {case.source_sheet} / {case.row_num}행",
+            on_save=lambda values, _month: self._save_existing_case(case, values),
+        )
+
+    def _show_case_editor(
+        self,
+        title: str,
+        initial: dict[str, object],
+        on_save: Callable[[dict[str, str], str], tuple[Path, str]],
+        month_values: Optional[list[str]] = None,
+        initial_month: str = "",
+        source_text: str = "",
+    ) -> None:
+        window = tk.Toplevel(self.root)
+        window.title(title)
+        window.geometry("620x560")
+        window.minsize(560, 500)
+        window.transient(self.root)
+        window.grab_set()
+        window.columnconfigure(1, weight=1)
+        row = 0
+
+        month_var = tk.StringVar(value=initial_month)
+        sequence_var = tk.StringVar(value=str(initial.get("sequence", "")))
+        if month_values is not None:
+            ttk.Label(window, text="대상 월").grid(row=row, column=0, sticky="w", padx=12, pady=(12, 6))
+            month_combo = ttk.Combobox(window, textvariable=month_var, values=month_values, state="readonly", width=16)
+            month_combo.grid(
+                row=row, column=1, sticky="w", padx=12, pady=(12, 6)
+            )
+            month_combo.bind(
+                "<<ComboboxSelected>>",
+                lambda _: sequence_var.set(self._get_next_sequence_for_month(month_var.get())),
+            )
+            row += 1
+        elif source_text:
+            ttk.Label(window, text="원본").grid(row=row, column=0, sticky="w", padx=12, pady=(12, 6))
+            ttk.Label(window, text=source_text).grid(row=row, column=1, sticky="w", padx=12, pady=(12, 6))
+            row += 1
+
+        date_var = tk.StringVar(value=str(initial.get("date", "")))
+        department_var = tk.StringVar(value=str(initial.get("department", "")))
+        user_var = tk.StringVar(value=str(initial.get("user", "")))
+        apc_var = tk.BooleanVar(value=bool(initial.get("apc", False)))
+        pc_filter_var = tk.BooleanVar(value=bool(initial.get("pc_filter", False)))
+        utmp_var = tk.BooleanVar(value=bool(initial.get("utmp", False)))
+
+        ttk.Label(window, text="순번").grid(row=row, column=0, sticky="w", padx=12, pady=6)
+        ttk.Entry(window, textvariable=sequence_var, width=12).grid(row=row, column=1, sticky="w", padx=12, pady=6)
+        row += 1
+        ttk.Label(window, text="날짜").grid(row=row, column=0, sticky="w", padx=12, pady=6)
+        ttk.Entry(window, textvariable=date_var).grid(row=row, column=1, sticky="ew", padx=12, pady=6)
+        row += 1
+        ttk.Label(window, text="부서").grid(row=row, column=0, sticky="w", padx=12, pady=6)
+        ttk.Entry(window, textvariable=department_var).grid(row=row, column=1, sticky="ew", padx=12, pady=6)
+        row += 1
+        ttk.Label(window, text="사용자").grid(row=row, column=0, sticky="w", padx=12, pady=6)
+        ttk.Entry(window, textvariable=user_var).grid(row=row, column=1, sticky="ew", padx=12, pady=6)
+        row += 1
+
+        ttk.Label(window, text="장애내용").grid(row=row, column=0, sticky="nw", padx=12, pady=6)
+        issue_text = tk.Text(window, height=5, wrap="word", font=("맑은 고딕", 10))
+        issue_text.grid(row=row, column=1, sticky="nsew", padx=12, pady=6)
+        issue_text.insert(tk.END, str(initial.get("issue", "")))
+        window.rowconfigure(row, weight=1)
+        row += 1
+
+        ttk.Label(window, text="조치내용").grid(row=row, column=0, sticky="nw", padx=12, pady=6)
+        action_text = tk.Text(window, height=6, wrap="word", font=("맑은 고딕", 10))
+        action_text.grid(row=row, column=1, sticky="nsew", padx=12, pady=6)
+        action_text.insert(tk.END, str(initial.get("action", "")))
+        window.rowconfigure(row, weight=1)
+        row += 1
+
+        checks = ttk.Frame(window)
+        checks.grid(row=row, column=1, sticky="w", padx=12, pady=6)
+        ttk.Checkbutton(checks, text="APC", variable=apc_var).pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Checkbutton(checks, text="PC filter", variable=pc_filter_var).pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Checkbutton(checks, text="UTMP", variable=utmp_var).pack(side=tk.LEFT)
+        row += 1
+
+        def save() -> None:
+            values = {
+                "sequence": sequence_var.get().strip(),
+                "date": date_var.get().strip(),
+                "department": department_var.get().strip(),
+                "user": user_var.get().strip(),
+                "issue": issue_text.get("1.0", tk.END).strip(),
+                "action": action_text.get("1.0", tk.END).strip(),
+                "apc": "O" if apc_var.get() else "",
+                "pc_filter": "O" if pc_filter_var.get() else "",
+                "utmp": "O" if utmp_var.get() else "",
+            }
+            if month_values is not None and not month_var.get():
+                messagebox.showwarning(APP_TITLE, "대상 월을 선택하세요.", parent=window)
+                return
+            if not values["sequence"]:
+                messagebox.showwarning(APP_TITLE, "순번을 입력하세요.", parent=window)
+                return
+            if not values["sequence"].isdigit():
+                messagebox.showwarning(APP_TITLE, "순번은 숫자로 입력하세요.", parent=window)
+                return
+            if month_values is not None and not values["date"]:
+                messagebox.showwarning(APP_TITLE, "날짜를 입력하세요.", parent=window)
+                return
+            if not values["department"]:
+                messagebox.showwarning(APP_TITLE, "부서를 입력하세요.", parent=window)
+                return
+            if not values["issue"] and not values["action"]:
+                messagebox.showwarning(APP_TITLE, "장애내용 또는 조치내용을 입력하세요.", parent=window)
+                return
+            try:
+                saved_path, success_message = on_save(values, month_var.get())
+            except PermissionError:
+                messagebox.showerror(
+                    APP_TITLE,
+                    "Excel 파일을 저장할 수 없습니다.\n\n원본 파일이 열려 있으면 닫은 뒤 다시 시도하세요.",
+                    parent=window,
+                )
+                return
+            except Exception as exc:
+                messagebox.showerror(APP_TITLE, f"저장 실패\n\n{exc}", parent=window)
+                return
+            window.destroy()
+            self.root.after(10, lambda: self._after_excel_write(saved_path, success_message))
+
+        buttons = ttk.Frame(window)
+        buttons.grid(row=row, column=0, columnspan=2, sticky="e", padx=12, pady=(8, 12))
+        ttk.Button(buttons, text="저장", command=save).pack(side=tk.LEFT)
+        ttk.Button(buttons, text="취소", command=window.destroy).pack(side=tk.LEFT, padx=(6, 0))
+
+    # 새 내역 추가 시 대상 월 파일의 마지막 순번을 기준으로 다음 번호를 제안한다.
+    def _get_available_source_months(self) -> list[str]:
+        folder = Path(self.folder_var.get()).expanduser()
+        if not folder.exists():
+            return []
+        months: set[str] = set()
+        for path in folder.rglob("*.xlsx"):
+            if get_excel_skip_reason(path):
+                continue
+            year, month = parse_year_month_from_path(path)
+            if year and month:
+                months.add(f"{year}-{month:02d}")
+        return sorted(months)
+
+    def _find_workbook_for_month(self, month_text: str) -> Optional[Path]:
+        try:
+            year_text, month_part = month_text.split("-", 1)
+            target = (int(year_text), int(month_part))
+        except ValueError:
+            return None
+        folder = Path(self.folder_var.get()).expanduser()
+        matches: list[Path] = []
+        for path in sorted(folder.rglob("*.xlsx")):
+            if get_excel_skip_reason(path):
+                continue
+            if parse_year_month_from_path(path) == target:
+                matches.append(path)
+        return matches[0] if matches else None
+
+    def _get_next_sequence_for_month(self, month_text: str) -> str:
+        path = self._find_workbook_for_month(month_text)
+        if path is None:
+            return ""
+        workbook = load_workbook(path, read_only=True, data_only=True)
+        try:
+            sheet = self._find_maintenance_sheet(workbook)
+            return str(self._next_sequence_number(sheet))
+        finally:
+            workbook.close()
+
+    def _find_maintenance_sheet(self, workbook: object) -> object:
+        for sheet in workbook.worksheets:
+            if looks_like_maintenance_sheet(sheet):
+                return sheet
+        raise RuntimeError("유지보수 양식 시트를 찾을 수 없습니다.")
+
+    def _find_next_insert_row(self, sheet: object) -> int:
+        last_row = 4
+        for row in range(max(sheet.max_row, 5), 4, -1):
+            if any(safe_cell(sheet.cell(row, col).value) for col in range(1, 10)):
+                last_row = row
+                break
+        return max(last_row + 1, 5)
+
+    def _next_sequence_number(self, sheet: object) -> int:
+        numbers: list[int] = []
+        for row in range(5, sheet.max_row + 1):
+            value = sheet.cell(row, 1).value
+            try:
+                numbers.append(int(value))
+            except (TypeError, ValueError):
+                continue
+        return max(numbers, default=0) + 1
+
+    def _copy_row_style(self, sheet: object, source_row: int, target_row: int) -> None:
+        if source_row < 5:
+            return
+        for col in range(1, 10):
+            source = sheet.cell(source_row, col)
+            target = sheet.cell(target_row, col)
+            if source.has_style:
+                target._style = copy(source._style)
+            target.number_format = source.number_format
+            target.font = copy(source.font)
+            target.fill = copy(source.fill)
+            target.border = copy(source.border)
+            target.alignment = copy(source.alignment)
+            target.protection = copy(source.protection)
+        sheet.row_dimensions[target_row].height = sheet.row_dimensions[source_row].height
+
+    def _write_case_values(self, sheet: object, row: int, values: dict[str, str], sequence: Optional[int] = None) -> None:
+        if sequence is not None and not values.get("sequence"):
+            values["sequence"] = str(sequence)
+        columns = {
+            1: "sequence",
+            2: "date",
+            3: "department",
+            4: "user",
+            5: "issue",
+            6: "action",
+            7: "apc",
+            8: "pc_filter",
+            9: "utmp",
+        }
+        for col, key in columns.items():
+            value = values.get(key, "")
+            if key == "sequence" and value:
+                sheet.cell(row, col).value = int(value)
+            else:
+                sheet.cell(row, col).value = value if value else None
+
+    def _save_new_case(self, month_text: str, values: dict[str, str]) -> tuple[Path, str]:
+        path = self._find_workbook_for_month(month_text)
+        if path is None:
+            raise RuntimeError(f"{month_text} 유지보수 엑셀 파일을 찾을 수 없습니다.")
+
+        workbook = load_workbook(path)
+        try:
+            sheet = self._find_maintenance_sheet(workbook)
+            insert_row = self._find_next_insert_row(sheet)
+            self._copy_row_style(sheet, insert_row - 1, insert_row)
+            self._write_case_values(sheet, insert_row, values)
+            workbook.save(path)
+        finally:
+            workbook.close()
+        return path, "새 내역을 추가했습니다."
+
+    def _save_existing_case(self, case: MaintenanceCase, values: dict[str, str]) -> tuple[Path, str]:
+        path = self._resolve_case_path(case)
+        if path is None:
+            raise RuntimeError(f"원본 파일을 찾을 수 없습니다: {case.source_file}")
+
+        workbook = load_workbook(path)
+        try:
+            if case.source_sheet not in workbook.sheetnames:
+                raise RuntimeError(f"원본 시트를 찾을 수 없습니다: {case.source_sheet}")
+            sheet = workbook[case.source_sheet]
+            self._write_case_values(sheet, case.row_num, values)
+            workbook.save(path)
+        finally:
+            workbook.close()
+
+        case.sequence_number = values["sequence"]
+        case.date_text = values["date"]
+        case.department = values["department"]
+        case.user = values["user"]
+        case.issue_text = values["issue"]
+        case.action_text = values["action"]
+        case.apc = values["apc"]
+        case.pc_filter = values["pc_filter"]
+        case.utmp = values["utmp"]
+        case.search_text = " ".join(
+            part
+            for part in [case.issue_text, case.action_text, case.department, case.user, case.date_text, case.sheet_title]
+            if part
+        )
+        self._refresh_selected_tree_row()
+        self._show_selected_detail()
+        return path, "선택 항목을 수정했습니다."
+
+    def _refresh_selected_tree_row(self) -> None:
+        selection = self.tree.selection()
+        if not selection:
+            return
+        idx = self.tree.index(selection[0])
+        if idx >= len(self.search_results):
+            return
+        result = self.search_results[idx]
+        case: MaintenanceCase = result["case"]
+        is_list_mode = result.get("mode") == "list"
+        self.tree.item(
+            selection[0],
+            values=(
+                result["rank"],
+                "-" if is_list_mode else self._format_percent(result["score"]),
+                case.year,
+                case.date_text,
+                case.department,
+                case.user,
+                self._shorten(case.issue_text, 36),
+                self._shorten(case.action_text, 52),
+                case.source_file,
+            ),
+        )
+
+    def _after_excel_write(self, path: Path, message: str) -> None:
+        folder = self.engine.loaded_folder or Path(self.folder_var.get()).expanduser()
+        stale_message = "프로그램에서 Excel 파일을 수정했습니다."
+        self.engine.index_stale = True
+        self.engine.index_stale_message = stale_message
+        self._set_index_notice(True, stale_message)
+        if folder.exists():
+            self._last_stale_warning_key = f"{folder.resolve()}|{stale_message}"
+        self.status_var.set(f"{message} 인덱스를 새로 구축해야 최신 검색 결과가 반영됩니다.")
+        if messagebox.askyesno(
+            APP_TITLE,
+            f"{message}\n\n변경 내용을 검색 결과에 반영하려면 인덱스를 새로 구축해야 합니다.\n지금 새로 구축할까요?",
+        ):
+            self._start_build(folder)
 
     def _set_busy(self, busy: bool) -> None:
         if busy:
@@ -1880,7 +2308,7 @@ class MaintenanceSearchApp:
         )
         self.detail_source_var.set(
             "원본 "
-            f"{case.source_file} · {case.source_sheet} · {case.row_num}행"
+            f"{case.source_file} · {case.source_sheet} · {case.row_num}행 · 순번 {case.sequence_number or '-'}"
             + (f" · {case.sheet_title}" if case.sheet_title else "")
         )
         self._set_text_value(self.detail_issue_text, case.issue_text or "-")
@@ -1916,6 +2344,7 @@ class MaintenanceSearchApp:
             headers = [
                 "순위",
                 "관련도",
+                "원본순번",
                 "연도",
                 "날짜",
                 "부서",
@@ -1938,6 +2367,7 @@ class MaintenanceSearchApp:
                     [
                         result["rank"],
                         "-" if is_list_mode else self._format_percent(result["score"]),
+                        case.sequence_number,
                         case.year,
                         case.date_text,
                         case.department,
@@ -1959,7 +2389,7 @@ class MaintenanceSearchApp:
                 cell.fill = header_fill
                 cell.alignment = Alignment(horizontal="center", vertical="center")
 
-            widths = [8, 12, 8, 12, 18, 14, 42, 55, 9, 11, 9, 24, 16, 10]
+            widths = [8, 12, 10, 8, 12, 18, 14, 42, 55, 9, 11, 9, 24, 16, 10]
             for index, width in enumerate(widths, start=1):
                 worksheet.column_dimensions[get_column_letter(index)].width = width
             for row in worksheet.iter_rows(min_row=2):
