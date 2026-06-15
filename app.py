@@ -34,9 +34,8 @@ CACHE_DB_NAME = "maintenance_cases.sqlite"
 CACHE_ARTIFACT_NAME = "search_artifacts.joblib"
 CACHE_REPORT_NAME = "index_report.json"
 DEFAULT_TOP_N = 20
-DEFAULT_BM25_STAGE = 120
 SEARCH_INDEX_VERSION = 4
-QUERY_HINT = "검색할 장애 증상이나 조치 내용을 입력하세요"
+QUERY_HINT = "장애, 조치, 부서, 사용자, 날짜 등을 입력하세요"
 EXCLUDE_FILE_KEYWORDS = (
     "검색결과",
     "보고서",
@@ -204,6 +203,38 @@ def create_empty_index_report() -> dict[str, object]:
         "excluded_row_details": [],
         "quality_details": [],
     }
+
+
+def add_report_detail(
+    report: dict[str, object],
+    detail_key: str,
+    detail_type: str,
+    file_name: str,
+    path: str,
+    sheet: str,
+    row: int,
+    reason: str,
+    date: str,
+    department: str,
+    user: str,
+    issue: str,
+    action: str,
+) -> None:
+    report[detail_key].append(
+        {
+            "type": detail_type,
+            "file": file_name,
+            "path": path,
+            "sheet": sheet,
+            "row": row,
+            "reason": reason,
+            "date": date,
+            "department": department,
+            "user": user,
+            "issue": issue,
+            "action": action,
+        }
+    )
 
 
 class MaintenanceRepository:
@@ -407,7 +438,6 @@ class MaintenanceSearchEngine:
             try:
                 sheet_names = workbook.sheetnames
                 read_sheet_count = 0
-                file_valid_cases = 0
 
                 for sheet_name in sheet_names:
                     sheet = workbook[sheet_name]
@@ -442,7 +472,6 @@ class MaintenanceSearchEngine:
                         report["total_rows"] = int(report["total_rows"]) + 1
                         row_values = tuple(row_values) + (None,) * (9 - len(row_values))
 
-                        seq = row_values[0]
                         date_value = safe_cell(row_values[1])
                         if date_value:
                             last_date = date_value
@@ -458,107 +487,107 @@ class MaintenanceSearchEngine:
                         if not issue_text and not action_text:
                             sheet_excluded_rows += 1
                             report["excluded_rows"] = int(report["excluded_rows"]) + 1
-                            report["excluded_row_details"].append(
-                                {
-                                    "type": "제외 행",
-                                    "file": xlsx_path.name,
-                                    "path": relative_path,
-                                    "sheet": source_sheet,
-                                    "row": row_num,
-                                    "reason": "장애내용/조치내용 모두 비어 있음",
-                                    "date": date_text,
-                                    "department": department,
-                                    "user": user,
-                                    "issue": issue_text,
-                                    "action": action_text,
-                                }
+                            add_report_detail(
+                                report,
+                                "excluded_row_details",
+                                "제외 행",
+                                xlsx_path.name,
+                                relative_path,
+                                source_sheet,
+                                row_num,
+                                "장애내용/조치내용 모두 비어 있음",
+                                date_text,
+                                department,
+                                user,
+                                issue_text,
+                                action_text,
                             )
                             continue
 
                         if not department:
                             report["missing_departments"] = int(report["missing_departments"]) + 1
-                            report["quality_details"].append(
-                                {
-                                    "type": "부서 누락",
-                                    "file": xlsx_path.name,
-                                    "path": relative_path,
-                                    "sheet": source_sheet,
-                                    "row": row_num,
-                                    "reason": "부서 미입력",
-                                    "date": date_text,
-                                    "department": department,
-                                    "user": user,
-                                    "issue": issue_text,
-                                    "action": action_text,
-                                }
+                            add_report_detail(
+                                report,
+                                "quality_details",
+                                "부서 누락",
+                                xlsx_path.name,
+                                relative_path,
+                                source_sheet,
+                                row_num,
+                                "부서 미입력",
+                                date_text,
+                                department,
+                                user,
+                                issue_text,
+                                action_text,
                             )
                         if not user:
                             report["missing_users"] = int(report["missing_users"]) + 1
-                            report["quality_details"].append(
-                                {
-                                    "type": "사용자 누락",
-                                    "file": xlsx_path.name,
-                                    "path": relative_path,
-                                    "sheet": source_sheet,
-                                    "row": row_num,
-                                    "reason": "사용자 미입력",
-                                    "date": date_text,
-                                    "department": department,
-                                    "user": user,
-                                    "issue": issue_text,
-                                    "action": action_text,
-                                }
+                            add_report_detail(
+                                report,
+                                "quality_details",
+                                "사용자 누락",
+                                xlsx_path.name,
+                                relative_path,
+                                source_sheet,
+                                row_num,
+                                "사용자 미입력",
+                                date_text,
+                                department,
+                                user,
+                                issue_text,
+                                action_text,
                             )
                         if not apc:
                             report["missing_apc"] = int(report["missing_apc"]) + 1
-                            report["quality_details"].append(
-                                {
-                                    "type": "APC 누락",
-                                    "file": xlsx_path.name,
-                                    "path": relative_path,
-                                    "sheet": source_sheet,
-                                    "row": row_num,
-                                    "reason": "APC 미입력",
-                                    "date": date_text,
-                                    "department": department,
-                                    "user": user,
-                                    "issue": issue_text,
-                                    "action": action_text,
-                                }
+                            add_report_detail(
+                                report,
+                                "quality_details",
+                                "APC 누락",
+                                xlsx_path.name,
+                                relative_path,
+                                source_sheet,
+                                row_num,
+                                "APC 미입력",
+                                date_text,
+                                department,
+                                user,
+                                issue_text,
+                                action_text,
                             )
                         if not pc_filter:
                             report["missing_pc_filter"] = int(report["missing_pc_filter"]) + 1
-                            report["quality_details"].append(
-                                {
-                                    "type": "PC filter 누락",
-                                    "file": xlsx_path.name,
-                                    "path": relative_path,
-                                    "sheet": source_sheet,
-                                    "row": row_num,
-                                    "reason": "PC filter 미입력",
-                                    "date": date_text,
-                                    "department": department,
-                                    "user": user,
-                                    "issue": issue_text,
-                                    "action": action_text,
-                                }
+                            add_report_detail(
+                                report,
+                                "quality_details",
+                                "PC filter 누락",
+                                xlsx_path.name,
+                                relative_path,
+                                source_sheet,
+                                row_num,
+                                "PC filter 미입력",
+                                date_text,
+                                department,
+                                user,
+                                issue_text,
+                                action_text,
                             )
                         if not utmp:
                             report["missing_utmp"] = int(report["missing_utmp"]) + 1
-                            report["quality_details"].append(
-                                {
-                                    "type": "UTMP 누락",
-                                    "file": xlsx_path.name,
-                                    "path": relative_path,
-                                    "sheet": source_sheet,
-                                    "row": row_num,
-                                    "reason": "UTMP 미입력",
-                                    "date": date_text,
-                                    "department": department,
-                                    "user": user,
-                                    "issue": issue_text,
-                                    "action": action_text,
-                                }
+                            add_report_detail(
+                                report,
+                                "quality_details",
+                                "UTMP 누락",
+                                xlsx_path.name,
+                                relative_path,
+                                source_sheet,
+                                row_num,
+                                "UTMP 미입력",
+                                date_text,
+                                department,
+                                user,
+                                issue_text,
+                                action_text,
                             )
 
                         searchable_text = " ".join(
@@ -597,7 +626,6 @@ class MaintenanceSearchEngine:
                         )
                         case_id += 1
                         sheet_valid_cases += 1
-                        file_valid_cases += 1
 
                     report["sheet_details"].append(
                         {
@@ -679,7 +707,6 @@ class MaintenanceSearchEngine:
         query: str,
         filters: SearchFilters,
         top_n: int = DEFAULT_TOP_N,
-        bm25_stage: int = DEFAULT_BM25_STAGE,
     ) -> list[dict[str, object]]:
         if not self.is_ready or self.artifacts is None:
             raise RuntimeError("검색 인덱스가 아직 준비되지 않았습니다.")
@@ -764,7 +791,7 @@ class MaintenanceSearchApp:
         self.root = root
         self.root.title(APP_TITLE)
         self.root.geometry("1400x860")
-        self.root.minsize(1200, 760)
+        self.root.minsize(980, 700)
 
         self.engine = MaintenanceSearchEngine()
         self.queue: Queue[tuple[str, object]] = Queue()
@@ -794,24 +821,25 @@ class MaintenanceSearchApp:
     def _build_ui(self) -> None:
         style = ttk.Style()
         try:
-            style.theme_use("clam")
+            theme_names = style.theme_names()
+            if sys.platform == "win32" and "vista" in theme_names:
+                style.theme_use("vista")
+            elif sys.platform == "darwin" and "aqua" in theme_names:
+                style.theme_use("aqua")
+            elif "clam" in theme_names:
+                style.theme_use("clam")
         except Exception:
             pass
         default_font = ("맑은 고딕", 10)
-        self.root.configure(bg="#F8FAFC")
         style.configure(".", font=default_font)
         style.configure("Search.TEntry", foreground="#111111")
         style.configure("SearchHint.TEntry", foreground="#777777")
-        style.configure("TFrame", background="#F8FAFC")
-        style.configure("TLabelframe", background="#F8FAFC")
-        style.configure("TLabelframe.Label", background="#F8FAFC", foreground="#1F2937", font=("맑은 고딕", 10, "bold"))
-        style.configure("TLabel", background="#F8FAFC", foreground="#1F2937")
-        style.configure("Treeview", rowheight=24, background="#FFFFFF", fieldbackground="#FFFFFF", foreground="#1F2937")
-        style.configure("Treeview.Heading", background="#E2E8F0", foreground="#1F2937", font=("맑은 고딕", 10, "bold"))
-        style.map("Treeview", background=[("selected", "#DBEAFE")], foreground=[("selected", "#111827")])
+        style.configure("TLabelframe.Label", font=("맑은 고딕", 10, "bold"))
+        style.configure("Treeview", rowheight=24)
+        style.configure("Treeview.Heading", font=("맑은 고딕", 10, "bold"))
 
         self.root.columnconfigure(0, weight=1)
-        self.root.rowconfigure(1, weight=1)
+        self.root.rowconfigure(1, weight=0)
 
         top = ttk.Frame(self.root, padding=10)
         top.grid(row=0, column=0, sticky="ew")
@@ -825,44 +853,51 @@ class MaintenanceSearchApp:
         ttk.Button(top, text="인덱스 리포트 보기", command=self._show_index_report).grid(row=0, column=4)
 
         search = ttk.LabelFrame(self.root, text="검색", padding=10)
-        search.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 10))
-        search.columnconfigure(1, weight=1)
+        search.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 10))
+        search.columnconfigure(0, weight=1)
 
-        ttk.Label(search, text="장애내용 / 조치내용").grid(row=0, column=0, sticky="w")
-        self.query_entry = ttk.Entry(search, textvariable=self.query_var, style="Search.TEntry")
-        self.query_entry.grid(row=0, column=1, sticky="ew", padx=(8, 8))
+        query_row = ttk.Frame(search)
+        query_row.grid(row=0, column=0, sticky="ew")
+        query_row.columnconfigure(1, weight=1)
+
+        ttk.Label(query_row, text="검색어").grid(row=0, column=0, sticky="w")
+        self.query_entry = ttk.Entry(query_row, textvariable=self.query_var, style="Search.TEntry")
+        self.query_entry.grid(row=0, column=1, sticky="ew", padx=(8, 0))
         self.query_entry.bind("<FocusIn>", self._hide_query_hint)
         self.query_entry.bind("<FocusOut>", self._show_query_hint)
         self.query_entry.bind("<Return>", lambda _: self._run_search())
-        ttk.Label(search, text="결과 수").grid(row=0, column=2, sticky="e")
-        ttk.Spinbox(search, from_=5, to=100, textvariable=self.top_n_var, width=6).grid(row=0, column=3, sticky="w", padx=(8, 0))
+
+        action_row = ttk.Frame(search)
+        action_row.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        ttk.Label(action_row, text="결과 수").pack(side=tk.LEFT)
+        ttk.Spinbox(action_row, from_=5, to=100, textvariable=self.top_n_var, width=6).pack(side=tk.LEFT, padx=(8, 12))
         actions = ttk.Frame(search)
-        actions.grid(row=0, column=4, sticky="e", padx=(10, 0))
+        actions.pack(side=tk.LEFT)
         ttk.Button(actions, text="검색", command=self._run_search).pack(side=tk.LEFT)
-        ttk.Button(actions, text="전체 사례 보기", command=self._show_all_cases).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(actions, text="전체 보기", command=self._show_all_cases).pack(side=tk.LEFT, padx=(6, 0))
 
         filter_frame = ttk.Frame(search)
-        filter_frame.grid(row=1, column=0, columnspan=5, sticky="ew", pady=(10, 8))
+        filter_frame.grid(row=2, column=0, sticky="ew", pady=(10, 8))
         for col in range(8):
             filter_frame.columnconfigure(col, weight=0)
 
-        ttk.Label(filter_frame, text="연도 from").grid(row=0, column=0, sticky="w")
-        self.year_from_combo = ttk.Combobox(filter_frame, textvariable=self.year_from_var, values=["전체"], width=10, state="readonly")
+        ttk.Label(filter_frame, text="시작 연도").grid(row=0, column=0, sticky="w")
+        self.year_from_combo = ttk.Combobox(filter_frame, textvariable=self.year_from_var, values=["전체"], width=9, state="readonly")
         self.year_from_combo.grid(row=0, column=1, sticky="w", padx=(6, 12))
         self.year_from_combo.bind("<<ComboboxSelected>>", lambda _: self._normalize_filter_range("year_from"))
 
-        ttk.Label(filter_frame, text="연도 to").grid(row=0, column=2, sticky="w")
-        self.year_to_combo = ttk.Combobox(filter_frame, textvariable=self.year_to_var, values=["전체"], width=10, state="readonly")
+        ttk.Label(filter_frame, text="종료 연도").grid(row=0, column=2, sticky="w")
+        self.year_to_combo = ttk.Combobox(filter_frame, textvariable=self.year_to_var, values=["전체"], width=9, state="readonly")
         self.year_to_combo.grid(row=0, column=3, sticky="w", padx=(6, 12))
         self.year_to_combo.bind("<<ComboboxSelected>>", lambda _: self._normalize_filter_range("year_to"))
 
-        ttk.Label(filter_frame, text="월 from").grid(row=0, column=4, sticky="w")
-        self.month_from_combo = ttk.Combobox(filter_frame, textvariable=self.month_from_var, values=["전체"], width=10, state="readonly")
+        ttk.Label(filter_frame, text="시작 월").grid(row=0, column=4, sticky="w")
+        self.month_from_combo = ttk.Combobox(filter_frame, textvariable=self.month_from_var, values=["전체"], width=9, state="readonly")
         self.month_from_combo.grid(row=0, column=5, sticky="w", padx=(6, 12))
         self.month_from_combo.bind("<<ComboboxSelected>>", lambda _: self._normalize_filter_range("month_from"))
 
-        ttk.Label(filter_frame, text="월 to").grid(row=0, column=6, sticky="w")
-        self.month_to_combo = ttk.Combobox(filter_frame, textvariable=self.month_to_var, values=["전체"], width=10, state="readonly")
+        ttk.Label(filter_frame, text="종료 월").grid(row=0, column=6, sticky="w")
+        self.month_to_combo = ttk.Combobox(filter_frame, textvariable=self.month_to_var, values=["전체"], width=9, state="readonly")
         self.month_to_combo.grid(row=0, column=7, sticky="w", padx=(6, 0))
         self.month_to_combo.bind("<<ComboboxSelected>>", lambda _: self._normalize_filter_range("month_to"))
 
@@ -932,12 +967,47 @@ class MaintenanceSearchApp:
             row=2, column=0, sticky="e", pady=(8, 0)
         )
 
-        detail_frame.rowconfigure(0, weight=1)
+        detail_frame.rowconfigure(1, weight=1)
         detail_frame.columnconfigure(0, weight=1)
-        self.detail_text = tk.Text(
-            detail_frame,
+
+        detail_meta = ttk.Frame(detail_frame)
+        detail_meta.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        for col in range(4):
+            detail_meta.columnconfigure(col, weight=1)
+        self.detail_rank_var = tk.StringVar(value="사례를 선택하세요.")
+        self.detail_score_var = tk.StringVar(value="")
+        self.detail_date_var = tk.StringVar(value="")
+        self.detail_person_var = tk.StringVar(value="")
+        self.detail_flags_var = tk.StringVar(value="")
+        ttk.Label(detail_meta, textvariable=self.detail_rank_var, font=("맑은 고딕", 10, "bold")).grid(
+            row=0, column=0, sticky="w", padx=(0, 12)
+        )
+        ttk.Label(detail_meta, textvariable=self.detail_score_var).grid(row=0, column=1, sticky="w", padx=(0, 12))
+        ttk.Label(detail_meta, textvariable=self.detail_date_var).grid(row=0, column=2, sticky="w", padx=(0, 12))
+        ttk.Label(detail_meta, textvariable=self.detail_person_var).grid(row=0, column=3, sticky="w")
+        ttk.Label(detail_meta, textvariable=self.detail_flags_var).grid(row=1, column=0, columnspan=4, sticky="w", pady=(4, 0))
+
+        detail_content = ttk.Frame(detail_frame)
+        detail_content.grid(row=1, column=0, sticky="nsew")
+        detail_content.rowconfigure(1, weight=1)
+        detail_content.columnconfigure(0, weight=1, uniform="detail")
+        detail_content.columnconfigure(1, weight=1, uniform="detail")
+
+        ttk.Label(detail_content, text="장애내용", font=("맑은 고딕", 10, "bold")).grid(
+            row=0, column=0, sticky="w", pady=(0, 4)
+        )
+        ttk.Label(detail_content, text="조치내용", font=("맑은 고딕", 10, "bold")).grid(
+            row=0, column=1, sticky="w", padx=(8, 0), pady=(0, 4)
+        )
+
+        issue_frame = ttk.Frame(detail_content)
+        issue_frame.grid(row=1, column=0, sticky="nsew", padx=(0, 8))
+        issue_frame.rowconfigure(0, weight=1)
+        issue_frame.columnconfigure(0, weight=1)
+        self.detail_issue_text = tk.Text(
+            issue_frame,
             wrap="word",
-            height=12,
+            height=7,
             bg="#FFFFFF",
             fg="#1F2937",
             insertbackground="#1F2937",
@@ -946,10 +1016,41 @@ class MaintenanceSearchApp:
             pady=8,
             font=("맑은 고딕", 10),
         )
-        self.detail_text.grid(row=0, column=0, sticky="nsew")
-        detail_scroll = ttk.Scrollbar(detail_frame, orient=tk.VERTICAL, command=self.detail_text.yview)
-        self.detail_text.configure(yscrollcommand=detail_scroll.set)
-        detail_scroll.grid(row=0, column=1, sticky="ns")
+        self.detail_issue_text.grid(row=0, column=0, sticky="nsew")
+        issue_scroll = ttk.Scrollbar(issue_frame, orient=tk.VERTICAL, command=self.detail_issue_text.yview)
+        self.detail_issue_text.configure(yscrollcommand=issue_scroll.set)
+        issue_scroll.grid(row=0, column=1, sticky="ns")
+
+        action_frame = ttk.Frame(detail_content)
+        action_frame.grid(row=1, column=1, sticky="nsew")
+        action_frame.rowconfigure(0, weight=1)
+        action_frame.columnconfigure(0, weight=1)
+        self.detail_action_text = tk.Text(
+            action_frame,
+            wrap="word",
+            height=7,
+            bg="#FFFFFF",
+            fg="#1F2937",
+            insertbackground="#1F2937",
+            relief=tk.FLAT,
+            padx=10,
+            pady=8,
+            font=("맑은 고딕", 10),
+        )
+        self.detail_action_text.grid(row=0, column=0, sticky="nsew")
+        action_scroll = ttk.Scrollbar(action_frame, orient=tk.VERTICAL, command=self.detail_action_text.yview)
+        self.detail_action_text.configure(yscrollcommand=action_scroll.set)
+        action_scroll.grid(row=0, column=1, sticky="ns")
+
+        self.detail_source_var = tk.StringVar(value="")
+        self.detail_source_label = ttk.Label(detail_frame, textvariable=self.detail_source_var)
+        self.detail_source_label.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        detail_frame.bind(
+            "<Configure>",
+            lambda event: self.detail_source_label.configure(wraplength=max(300, event.width - 24)),
+            add="+",
+        )
+        self._set_detail_empty_message("검색 결과에서 사례를 선택하면 상세 내용이 표시됩니다.")
 
         bottom = ttk.Frame(self.root, padding=(10, 0, 10, 10))
         bottom.grid(row=3, column=0, sticky="ew")
@@ -1157,6 +1258,7 @@ class MaintenanceSearchApp:
         quality_frame.rowconfigure(2, weight=1)
         detail_tree, detail_by_iid = self._populate_report_detail_tree(detail_frame, detail_rows)
         detail_frame.grid_remove()
+        detail_status_var = tk.StringVar(value="상세 행을 선택하면 원본 파일 위치를 열 수 있습니다.")
 
         def toggle_detail() -> None:
             if detail_visible_var.get():
@@ -1164,17 +1266,31 @@ class MaintenanceSearchApp:
             else:
                 detail_frame.grid_remove()
 
+        def update_detail_action(_: object = None) -> None:
+            selection = detail_tree.selection()
+            can_open = bool(selection and selection[0] in detail_by_iid)
+            if can_open:
+                open_button.state(["!disabled"])
+                detail_status_var.set("선택한 행의 원본 파일 위치를 열 수 있습니다.")
+            else:
+                open_button.state(["disabled"])
+                detail_status_var.set("상세 행을 선택하면 원본 파일 위치를 열 수 있습니다.")
+
         ttk.Checkbutton(
             detail_controls,
             text="상세 행 위치 표시",
             variable=detail_visible_var,
             command=toggle_detail,
         ).pack(side=tk.LEFT)
-        ttk.Button(
+        open_button = ttk.Button(
             detail_controls,
             text="선택 위치 열기",
-            command=lambda: self._open_selected_report_detail(detail_tree, detail_by_iid),
-        ).pack(side=tk.LEFT, padx=(8, 0))
+            command=lambda: self._open_selected_report_detail(detail_tree, detail_by_iid, detail_status_var),
+        )
+        open_button.pack(side=tk.LEFT, padx=(8, 0))
+        open_button.state(["disabled"])
+        ttk.Label(detail_controls, textvariable=detail_status_var).pack(side=tk.LEFT, padx=(10, 0))
+        detail_tree.bind("<<TreeviewSelect>>", update_detail_action, add="+")
 
     def _populate_tree(
         self,
@@ -1272,13 +1388,19 @@ class MaintenanceSearchApp:
         self,
         tree: ttk.Treeview,
         detail_by_iid: dict[str, dict[str, object]],
+        status_var: Optional[tk.StringVar] = None,
     ) -> None:
         selection = tree.selection()
         if not selection:
-            messagebox.showwarning(APP_TITLE, "먼저 상세 행을 선택하세요.")
+            if status_var is not None:
+                status_var.set("상세 행을 먼저 선택하세요.")
+            else:
+                messagebox.showwarning(APP_TITLE, "먼저 상세 행을 선택하세요.")
             return
         detail = detail_by_iid.get(selection[0])
         if not detail:
+            if status_var is not None:
+                status_var.set("열 수 있는 상세 행이 아닙니다.")
             return
         self._open_report_location(detail)
 
@@ -1350,6 +1472,41 @@ class MaintenanceSearchApp:
             }
         )
 
+    def _get_month_values_for_selected_years(self) -> list[str]:
+        if not self.month_values:
+            return []
+
+        def parse_year(value: str) -> Optional[int]:
+            if not value or value == "전체":
+                return None
+            try:
+                return int(value)
+            except ValueError:
+                return None
+
+        start_year = parse_year(self.year_from_var.get())
+        end_year = parse_year(self.year_to_var.get())
+        if start_year is None and end_year is None:
+            return self.month_values
+        if start_year is None:
+            start_year = end_year
+        if end_year is None:
+            end_year = start_year
+        if start_year is None or end_year is None:
+            return self.month_values
+        if start_year > end_year:
+            start_year, end_year = end_year, start_year
+
+        filtered: list[str] = []
+        for value in self.month_values:
+            try:
+                year = int(value.split("-", 1)[0])
+            except ValueError:
+                continue
+            if start_year <= year <= end_year:
+                filtered.append(value)
+        return filtered
+
     def _refresh_filter_combos(self) -> None:
         year_values = ["전체"] + [str(year) for year in self.year_values]
         self.year_from_combo.configure(values=year_values)
@@ -1358,57 +1515,78 @@ class MaintenanceSearchApp:
             self.year_from_var.set("전체")
         if self.year_to_var.get() not in year_values:
             self.year_to_var.set("전체")
-        self._normalize_filter_range("year_from")
+        self._normalize_filter_range("year_from", refresh_months=False)
+        self._refresh_month_combos()
 
-        month_values = ["전체"] + self.month_values
+    def _refresh_month_combos(self) -> None:
+        month_values = ["전체"] + self._get_month_values_for_selected_years()
         self.month_from_combo.configure(values=month_values)
         self.month_to_combo.configure(values=month_values)
         if self.month_from_var.get() not in month_values:
             self.month_from_var.set("전체")
         if self.month_to_var.get() not in month_values:
             self.month_to_var.set("전체")
-        self._normalize_filter_range("month_from")
+        self._normalize_filter_range("month_from", refresh_months=False)
 
-    def _normalize_filter_range(self, changed: str) -> None:
-        if changed.startswith("year"):
+    def _normalize_filter_range(self, changed: str, refresh_months: bool = True) -> None:
+        is_year = changed.startswith("year")
+        if is_year:
             values = [str(year) for year in self.year_values]
             from_var = self.year_from_var
             to_var = self.year_to_var
             changed_from = changed == "year_from"
         else:
-            values = self.month_values
+            values = self._get_month_values_for_selected_years()
             from_var = self.month_from_var
             to_var = self.month_to_var
             changed_from = changed == "month_from"
 
+        def finish() -> None:
+            if is_year and refresh_months:
+                self._refresh_month_combos()
+
         if not values:
             from_var.set("전체")
             to_var.set("전체")
+            finish()
             return
 
         start = from_var.get()
         end = to_var.get()
+        if start != "전체" and start not in values:
+            from_var.set("전체")
+            start = "전체"
+        if end != "전체" and end not in values:
+            to_var.set("전체")
+            end = "전체"
+
         if start == "전체" and end == "전체":
+            finish()
             return
 
         if changed_from:
             if start == "전체":
                 to_var.set("전체")
+                finish()
                 return
             if end == "전체":
-                to_var.set(values[-1])
+                to_var.set(start)
+                finish()
                 return
             if values.index(start) > values.index(end):
                 to_var.set(start)
         else:
             if end == "전체":
                 from_var.set("전체")
+                finish()
                 return
             if start == "전체":
                 from_var.set(end)
+                finish()
                 return
             if values.index(start) > values.index(end):
                 from_var.set(end)
+        finish()
 
     def _collect_filters(self) -> SearchFilters:
         def parse_year(value: str) -> Optional[int]:
@@ -1474,9 +1652,9 @@ class MaintenanceSearchApp:
     def _show_results(self, results: list[dict[str, object]], empty_message: str = "검색 결과가 없습니다.") -> None:
         self.search_results = results
         self.tree.delete(*self.tree.get_children())
-        self.detail_text.delete("1.0", tk.END)
+        self._clear_detail_display()
         if not results:
-            self.detail_text.insert(tk.END, empty_message)
+            self._set_detail_empty_message(empty_message)
             return
 
         for result in results:
@@ -1504,6 +1682,54 @@ class MaintenanceSearchApp:
     def _shorten(self, text: str, limit: int) -> str:
         return text if len(text) <= limit else text[: limit - 1] + "…"
 
+    def _clear_detail_display(self) -> None:
+        self.detail_rank_var.set("")
+        self.detail_score_var.set("")
+        self.detail_date_var.set("")
+        self.detail_person_var.set("")
+        self.detail_flags_var.set("")
+        self.detail_source_var.set("")
+        self._set_text_value(self.detail_issue_text, "")
+        self._set_text_value(self.detail_action_text, "")
+
+    def _set_detail_empty_message(self, message: str) -> None:
+        self.detail_rank_var.set(message)
+        self.detail_score_var.set("")
+        self.detail_date_var.set("")
+        self.detail_person_var.set("")
+        self.detail_flags_var.set("")
+        self.detail_source_var.set("")
+        self._set_text_value(self.detail_issue_text, "")
+        self._set_text_value(self.detail_action_text, "")
+
+    def _set_text_value(self, widget: tk.Text, value: str) -> None:
+        widget.configure(state=tk.NORMAL)
+        widget.delete("1.0", tk.END)
+        widget.insert(tk.END, value)
+        widget.configure(state=tk.DISABLED)
+
+    def _format_case_date(self, case: MaintenanceCase) -> str:
+        text = normalize_text(case.date_text)
+        if text:
+            match = re.search(r"(20\d{2})[.\-/년\s]+(\d{1,2})[.\-/월\s]+(\d{1,2})", text)
+            if match:
+                return f"{int(match.group(1))}년 {int(match.group(2))}월 {int(match.group(3))}일"
+
+            match = re.search(r"(\d{1,2})\s*월\s*(\d{1,2})\s*일", text)
+            if match and case.year:
+                return f"{case.year}년 {int(match.group(1))}월 {int(match.group(2))}일"
+
+            match = re.search(r"(\d{1,2})[.\-/](\d{1,2})", text)
+            if match and case.year:
+                return f"{case.year}년 {int(match.group(1))}월 {int(match.group(2))}일"
+
+            return text
+        if case.year and case.month:
+            return f"{case.year}년 {case.month}월"
+        if case.year:
+            return f"{case.year}년"
+        return "-"
+
     def _show_selected_detail(self, event: object | None = None) -> None:
         selection = self.tree.selection()
         if not selection:
@@ -1514,33 +1740,31 @@ class MaintenanceSearchApp:
         result = self.search_results[idx]
         case: MaintenanceCase = result["case"]
         is_list_mode = result.get("mode") == "list"
-        detail_lines = [
-            f"순위: {result['rank']}",
-            f"관련도: {'-' if is_list_mode else self._format_percent(result['score'])}",
-            f"키워드 일치: {'-' if is_list_mode else self._format_percent(result['keyword_score'])}",
-            f"내용 유사도: {'-' if is_list_mode else self._format_percent(result['similarity_score'])}",
-            "",
-            f"연도/월: {case.year} / {case.month}",
-            f"날짜: {case.date_text}",
-            f"부서: {case.department}",
-            f"사용자: {case.user}",
-            f"APC: {case.apc}",
-            f"PC filter: {case.pc_filter}",
-            f"UTMP: {case.utmp}",
-            "",
-            "장애내용:",
-            case.issue_text or "-",
-            "",
-            "조치내용:",
-            case.action_text or "-",
-            "",
-            f"원본파일: {case.source_file}",
-            f"시트: {case.source_sheet}",
-            f"행번호: {case.row_num}",
-            f"시트제목: {case.sheet_title}",
-        ]
-        self.detail_text.delete("1.0", tk.END)
-        self.detail_text.insert(tk.END, "\n".join(detail_lines))
+        self.detail_rank_var.set(f"순위 {result['rank']}")
+        if is_list_mode:
+            self.detail_score_var.set("관련도 -")
+        else:
+            self.detail_score_var.set(
+                " · ".join(
+                    [
+                        f"관련도 {self._format_percent(result['score'])}",
+                        f"키워드 {self._format_percent(result['keyword_score'])}",
+                        f"유사도 {self._format_percent(result['similarity_score'])}",
+                    ]
+                )
+            )
+        self.detail_date_var.set(f"일자 {self._format_case_date(case)}")
+        self.detail_person_var.set(f"부서 {case.department or '-'} · 사용자 {case.user or '-'}")
+        self.detail_flags_var.set(
+            f"APC {case.apc or '-'} · PC filter {case.pc_filter or '-'} · UTMP {case.utmp or '-'}"
+        )
+        self.detail_source_var.set(
+            "원본 "
+            f"{case.source_file} · {case.source_sheet} · {case.row_num}행"
+            + (f" · {case.sheet_title}" if case.sheet_title else "")
+        )
+        self._set_text_value(self.detail_issue_text, case.issue_text or "-")
+        self._set_text_value(self.detail_action_text, case.action_text or "-")
 
     @staticmethod
     def _format_percent(value: object) -> str:
@@ -1639,7 +1863,14 @@ class MaintenanceSearchApp:
 def main() -> None:
     root = tk.Tk()
     try:
-        ttk.Style().theme_use("clam")
+        style = ttk.Style()
+        theme_names = style.theme_names()
+        if sys.platform == "win32" and "vista" in theme_names:
+            style.theme_use("vista")
+        elif sys.platform == "darwin" and "aqua" in theme_names:
+            style.theme_use("aqua")
+        elif "clam" in theme_names:
+            style.theme_use("clam")
     except Exception:
         pass
     MaintenanceSearchApp(root)
