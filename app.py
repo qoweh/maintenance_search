@@ -30,6 +30,8 @@ CACHE_DB_NAME = "maintenance_cases.sqlite"
 CACHE_ARTIFACT_NAME = "search_artifacts.joblib"
 DEFAULT_TOP_N = 20
 DEFAULT_BM25_STAGE = 120
+SEARCH_INDEX_VERSION = 2
+QUERY_HINT = "검색할 장애 증상이나 조치 내용을 입력하세요"
 
 
 @dataclass(slots=True)
@@ -207,6 +209,7 @@ class MaintenanceRepository:
         self.ensure_cache_dir()
         joblib.dump(
             {
+                "index_version": SEARCH_INDEX_VERSION,
                 "records": artifacts.records,
                 "vectorizer": artifacts.vectorizer,
                 "tfidf_matrix": artifacts.tfidf_matrix,
@@ -222,6 +225,8 @@ class MaintenanceRepository:
         if not self.artifact_path.exists():
             return None
         payload = joblib.load(self.artifact_path)
+        if payload.get("index_version") != SEARCH_INDEX_VERSION:
+            return None
         return SearchArtifacts(
             records=payload["records"],
             vectorizer=payload["vectorizer"],
@@ -265,11 +270,11 @@ class MaintenanceSearchEngine:
         tokenized_texts = [tokenize(text) for text in searchable_texts]
 
         vectorizer = TfidfVectorizer(
-            tokenizer=tokenize,
-            preprocessor=None,
-            lowercase=False,
-            token_pattern=None,
+            analyzer="char_wb",
+            ngram_range=(2, 5),
             min_df=1,
+            sublinear_tf=True,
+            norm="l2",
         )
         tfidf_matrix = vectorizer.fit_transform(searchable_texts)
         bm25 = BM25Index(tokenized_texts)
@@ -409,16 +414,12 @@ class MaintenanceSearchEngine:
         query_tokens = tokenize(query)
         bm25_scores = self.artifacts.bm25.score(query_tokens)
         candidate_scores = bm25_scores[candidate_indices]
-        stage1_count = min(max(bm25_stage, top_n), len(candidate_indices))
-        stage1_rel_indices = np.argsort(-candidate_scores)[:stage1_count]
-        stage1_indices = [candidate_indices[i] for i in stage1_rel_indices]
 
         query_vector = self.artifacts.vectorizer.transform([query])
-        stage1_matrix = self.artifacts.tfidf_matrix[stage1_indices]
-        vector_scores = np.asarray(stage1_matrix.dot(query_vector.T).toarray()).ravel()
-        bm25_stage_scores = candidate_scores[stage1_rel_indices]
+        candidate_matrix = self.artifacts.tfidf_matrix[candidate_indices]
+        vector_scores = np.asarray(candidate_matrix.dot(query_vector.T).toarray()).ravel()
 
-        bm25_norm = self._normalize_scores(bm25_stage_scores)
+        bm25_norm = self._normalize_scores(candidate_scores)
         vec_norm = self._normalize_scores(vector_scores)
         final_scores = (0.45 * bm25_norm) + (0.55 * vec_norm)
         positive_indices = np.where(final_scores > 1e-8)[0]
@@ -428,13 +429,15 @@ class MaintenanceSearchEngine:
         ranked = positive_indices[np.argsort(-final_scores[positive_indices])][:top_n]
         results: list[dict[str, object]] = []
         for rank, rel_idx in enumerate(ranked, start=1):
-            case = self.records[stage1_indices[rel_idx]]
+            case = self.records[candidate_indices[rel_idx]]
             results.append(
                 {
                     "rank": rank,
                     "score": float(final_scores[rel_idx]),
-                    "bm25": float(bm25_stage_scores[rel_idx]),
+                    "bm25": float(candidate_scores[rel_idx]),
                     "vector": float(vector_scores[rel_idx]),
+                    "keyword_score": float(bm25_norm[rel_idx]),
+                    "similarity_score": float(vec_norm[rel_idx]),
                     "case": case,
                 }
             )
@@ -477,9 +480,14 @@ class MaintenanceSearchApp:
         self.status_var = tk.StringVar(value="인덱스를 불러오거나 새로 구축하세요.")
 
         self._build_ui()
+        self._show_query_hint()
         self._try_load_existing_index()
 
     def _build_ui(self) -> None:
+        style = ttk.Style()
+        style.configure("Search.TEntry", foreground="#111111")
+        style.configure("SearchHint.TEntry", foreground="#777777")
+
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(1, weight=1)
 
@@ -500,9 +508,11 @@ class MaintenanceSearchApp:
         search.rowconfigure(2, weight=1)
 
         ttk.Label(search, text="장애내용 / 조치내용").grid(row=0, column=0, sticky="w")
-        query_entry = ttk.Entry(search, textvariable=self.query_var)
-        query_entry.grid(row=0, column=1, sticky="ew", padx=(8, 8))
-        query_entry.bind("<Return>", lambda _: self._run_search())
+        self.query_entry = ttk.Entry(search, textvariable=self.query_var, style="Search.TEntry")
+        self.query_entry.grid(row=0, column=1, sticky="ew", padx=(8, 8))
+        self.query_entry.bind("<FocusIn>", self._hide_query_hint)
+        self.query_entry.bind("<FocusOut>", self._show_query_hint)
+        self.query_entry.bind("<Return>", lambda _: self._run_search())
         ttk.Label(search, text="결과 수").grid(row=0, column=2, sticky="e")
         ttk.Spinbox(search, from_=5, to=100, textvariable=self.top_n_var, width=6).grid(row=0, column=3, sticky="w", padx=(8, 0))
         ttk.Button(search, text="검색", command=self._run_search).grid(row=0, column=4, padx=(10, 0))
@@ -510,7 +520,7 @@ class MaintenanceSearchApp:
         filter_frame = ttk.Frame(search)
         filter_frame.grid(row=1, column=0, columnspan=5, sticky="ew", pady=(10, 8))
         for col in range(10):
-            filter_frame.columnconfigure(col, weight=1 if col in (1, 4, 6, 8) else 0)
+            filter_frame.columnconfigure(col, weight=0)
 
         ttk.Label(filter_frame, text="연도 from").grid(row=0, column=0, sticky="w")
         self.year_from_combo = ttk.Combobox(filter_frame, textvariable=self.year_from_var, values=["전체"], width=10, state="readonly")
@@ -521,10 +531,14 @@ class MaintenanceSearchApp:
         self.year_to_combo.grid(row=0, column=3, sticky="w", padx=(6, 12))
 
         ttk.Label(filter_frame, text="부서 포함").grid(row=0, column=4, sticky="w")
-        ttk.Entry(filter_frame, textvariable=self.department_var, width=20).grid(row=0, column=5, sticky="w", padx=(6, 12))
+        ttk.Entry(filter_frame, textvariable=self.department_var, width=16).grid(
+            row=0, column=5, sticky="w", padx=(6, 16)
+        )
 
         ttk.Label(filter_frame, text="사용자 포함").grid(row=0, column=6, sticky="w")
-        ttk.Entry(filter_frame, textvariable=self.user_var, width=20).grid(row=0, column=7, sticky="w", padx=(6, 12))
+        ttk.Entry(filter_frame, textvariable=self.user_var, width=14).grid(
+            row=0, column=7, sticky="w", padx=(6, 16)
+        )
 
         flags = ttk.Frame(filter_frame)
         flags.grid(row=0, column=8, columnspan=2, sticky="w")
@@ -543,13 +557,11 @@ class MaintenanceSearchApp:
 
         results_frame.rowconfigure(0, weight=1)
         results_frame.columnconfigure(0, weight=1)
-        columns = ("rank", "score", "bm25", "vector", "year", "date", "dept", "user", "issue", "action", "file")
+        columns = ("rank", "score", "year", "date", "dept", "user", "issue", "action", "file")
         self.tree = ttk.Treeview(results_frame, columns=columns, show="headings", height=16)
         headings = {
             "rank": "순위",
-            "score": "종합",
-            "bm25": "BM25",
-            "vector": "벡터",
+            "score": "관련도",
             "year": "연도",
             "date": "날짜",
             "dept": "부서",
@@ -560,9 +572,7 @@ class MaintenanceSearchApp:
         }
         widths = {
             "rank": 60,
-            "score": 80,
-            "bm25": 80,
-            "vector": 80,
+            "score": 90,
             "year": 70,
             "date": 100,
             "dept": 180,
@@ -581,6 +591,10 @@ class MaintenanceSearchApp:
         vsb.grid(row=0, column=1, sticky="ns")
         hsb.grid(row=1, column=0, sticky="ew")
         self.tree.bind("<<TreeviewSelect>>", self._show_selected_detail)
+
+        ttk.Button(results_frame, text="검색 결과 엑셀 저장", command=self._export_results).grid(
+            row=2, column=0, sticky="e", pady=(8, 0)
+        )
 
         detail_frame.rowconfigure(0, weight=1)
         detail_frame.columnconfigure(0, weight=1)
@@ -603,6 +617,16 @@ class MaintenanceSearchApp:
             self.folder_var.set(selected)
             self.status_var.set(f"폴더 선택 완료: {selected}")
             self._load_index()
+
+    def _show_query_hint(self, event: object | None = None) -> None:
+        if not self.query_var.get().strip():
+            self.query_var.set(QUERY_HINT)
+            self.query_entry.configure(style="SearchHint.TEntry")
+
+    def _hide_query_hint(self, event: object | None = None) -> None:
+        if self.query_var.get() == QUERY_HINT:
+            self.query_var.set("")
+            self.query_entry.configure(style="Search.TEntry")
 
     def _start_build(self) -> None:
         folder = Path(self.folder_var.get()).expanduser()
@@ -715,7 +739,7 @@ class MaintenanceSearchApp:
             messagebox.showwarning(APP_TITLE, "먼저 인덱스를 구축하거나 불러오세요.")
             return
         query = self.query_var.get().strip()
-        if not query:
+        if not query or query == QUERY_HINT:
             messagebox.showwarning(APP_TITLE, "검색어를 입력하세요.")
             return
 
@@ -742,9 +766,7 @@ class MaintenanceSearchApp:
                 tk.END,
                 values=(
                     result["rank"],
-                    f"{result['score']:.3f}",
-                    f"{result['bm25']:.3f}",
-                    f"{result['vector']:.3f}",
+                    self._format_percent(result["score"]),
                     case.year,
                     case.date_text,
                     case.department,
@@ -772,9 +794,9 @@ class MaintenanceSearchApp:
         case: MaintenanceCase = result["case"]
         detail = {
             "순위": result["rank"],
-            "종합점수": round(float(result["score"]), 4),
-            "BM25": round(float(result["bm25"]), 4),
-            "벡터": round(float(result["vector"]), 4),
+            "관련도": self._format_percent(result["score"]),
+            "키워드 일치": self._format_percent(result["keyword_score"]),
+            "내용 유사도": self._format_percent(result["similarity_score"]),
             "연도": case.year,
             "월": case.month,
             "날짜": case.date_text,
@@ -792,6 +814,97 @@ class MaintenanceSearchApp:
         }
         self.detail_text.delete("1.0", tk.END)
         self.detail_text.insert(tk.END, json.dumps(detail, ensure_ascii=False, indent=2))
+
+    @staticmethod
+    def _format_percent(value: object) -> str:
+        number = float(value)
+        return f"{max(0.0, min(number, 1.0)) * 100:.1f}%"
+
+    def _export_results(self) -> None:
+        if not self.search_results:
+            messagebox.showwarning(APP_TITLE, "먼저 검색을 실행하세요.")
+            return
+
+        output_path = filedialog.asksaveasfilename(
+            title="검색 결과 엑셀 저장",
+            defaultextension=".xlsx",
+            filetypes=[("Excel 통합 문서", "*.xlsx")],
+            initialfile="유지보수_유사사례_검색결과.xlsx",
+        )
+        if not output_path:
+            return
+
+        try:
+            from openpyxl import Workbook
+            from openpyxl.styles import Alignment, Font, PatternFill
+
+            workbook = Workbook()
+            worksheet = workbook.active
+            worksheet.title = "유사사례 검색결과"
+            headers = [
+                "순위",
+                "관련도",
+                "키워드 일치",
+                "내용 유사도",
+                "연도",
+                "월",
+                "날짜",
+                "부서",
+                "사용자",
+                "장애내용",
+                "조치내용",
+                "APC",
+                "PC filter",
+                "UTMP",
+                "원본파일",
+                "시트",
+                "행번호",
+            ]
+            worksheet.append(headers)
+
+            for result in self.search_results:
+                case: MaintenanceCase = result["case"]
+                worksheet.append(
+                    [
+                        result["rank"],
+                        self._format_percent(result["score"]),
+                        self._format_percent(result["keyword_score"]),
+                        self._format_percent(result["similarity_score"]),
+                        case.year,
+                        case.month,
+                        case.date_text,
+                        case.department,
+                        case.user,
+                        case.issue_text,
+                        case.action_text,
+                        case.apc,
+                        case.pc_filter,
+                        case.utmp,
+                        case.source_file,
+                        case.source_sheet,
+                        case.row_num,
+                    ]
+                )
+
+            header_fill = PatternFill("solid", fgColor="D9EAF7")
+            for cell in worksheet[1]:
+                cell.font = Font(bold=True)
+                cell.fill = header_fill
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+
+            widths = [8, 12, 14, 14, 8, 8, 12, 18, 14, 42, 55, 9, 11, 9, 24, 16, 10]
+            for index, width in enumerate(widths, start=1):
+                worksheet.column_dimensions[chr(64 + index)].width = width
+            for row in worksheet.iter_rows(min_row=2):
+                for cell in row:
+                    cell.alignment = Alignment(vertical="top", wrap_text=True)
+            worksheet.freeze_panes = "A2"
+            worksheet.auto_filter.ref = worksheet.dimensions
+            workbook.save(output_path)
+            self.status_var.set(f"엑셀 저장 완료: {output_path}")
+            messagebox.showinfo(APP_TITLE, "검색 결과를 엑셀 파일로 저장했습니다.")
+        except Exception as exc:
+            messagebox.showerror(APP_TITLE, f"엑셀 저장 실패\n\n{exc}")
 
 
 def main() -> None:
