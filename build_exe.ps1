@@ -98,6 +98,8 @@ for dll_name in ("tcl86t.dll", "tk86t.dll"):
         --additional-hooks-dir $tempBuildConfig `
         --hidden-import "tkinter" `
         --hidden-import "_tkinter" `
+        --hidden-import "win32com" `
+        --hidden-import "win32com.client" `
         --specpath $tempBuildConfig `
         --distpath $distPath `
         --workpath $workPath `
