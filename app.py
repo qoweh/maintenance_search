@@ -12,6 +12,7 @@ import traceback
 from copy import copy
 from collections import Counter
 from dataclasses import asdict, dataclass
+from datetime import date, datetime
 from pathlib import Path
 from queue import Empty, Queue
 from typing import Callable, Optional
@@ -1969,6 +1970,63 @@ class MaintenanceSearchApp:
                 break
         return max(last_row + 1, 5)
 
+    def _last_data_row(self, sheet: object) -> int:
+        for row in range(max(sheet.max_row, 5), 4, -1):
+            if any(safe_cell(sheet.cell(row, col).value) for col in range(1, 10)):
+                return row
+        return 4
+
+    @staticmethod
+    def _parse_month_day(value: object) -> Optional[tuple[int, int]]:
+        if isinstance(value, (datetime, date)):
+            return value.month, value.day
+        text = safe_cell(value)
+        if not text:
+            return None
+        match = re.search(r"(?:20\d{2})[.\-/년\s]+(\d{1,2})[.\-/월\s]+(\d{1,2})", text)
+        if match:
+            return int(match.group(1)), int(match.group(2))
+        match = re.search(r"(\d{1,2})\s*월\s*(\d{1,2})\s*일?", text)
+        if match:
+            return int(match.group(1)), int(match.group(2))
+        match = re.search(r"(\d{1,2})[.\-/](\d{1,2})", text)
+        if match:
+            return int(match.group(1)), int(match.group(2))
+        return None
+
+    def _find_insert_row_for_date(self, sheet: object, date_text: str) -> tuple[int, bool]:
+        target = self._parse_month_day(date_text)
+        if target is None:
+            return self._find_next_insert_row(sheet), True
+
+        last_data_row = self._last_data_row(sheet)
+        if last_data_row < 5:
+            return 5, True
+
+        current_date: Optional[tuple[int, int]] = None
+        row = 5
+        while row <= last_data_row:
+            explicit_date = self._parse_month_day(sheet.cell(row, 2).value)
+            if explicit_date is None:
+                row += 1
+                continue
+            if target < explicit_date:
+                return row, True
+            if target == explicit_date:
+                group_last_row = row
+                scan_row = row + 1
+                while scan_row <= last_data_row:
+                    if self._parse_month_day(sheet.cell(scan_row, 2).value) is not None:
+                        break
+                    if any(safe_cell(sheet.cell(scan_row, col).value) for col in range(1, 10)):
+                        group_last_row = scan_row
+                    scan_row += 1
+                return group_last_row + 1, False
+            current_date = explicit_date
+            row += 1
+
+        return last_data_row + 1, current_date != target
+
     def _next_sequence_number(self, sheet: object) -> int:
         numbers: list[int] = []
         for row in range(5, sheet.max_row + 1):
@@ -2025,9 +2083,18 @@ class MaintenanceSearchApp:
         workbook = load_workbook(path)
         try:
             sheet = self._find_maintenance_sheet(workbook)
-            insert_row = self._find_next_insert_row(sheet)
-            self._copy_row_style(sheet, insert_row - 1, insert_row)
-            self._write_case_values(sheet, insert_row, values)
+            insert_row, should_write_date = self._find_insert_row_for_date(sheet, values.get("date", ""))
+            last_data_row = self._last_data_row(sheet)
+            if insert_row <= last_data_row:
+                sheet.insert_rows(insert_row)
+                style_source_row = insert_row + 1 if insert_row == 5 else insert_row - 1
+            else:
+                style_source_row = insert_row - 1
+            self._copy_row_style(sheet, style_source_row, insert_row)
+            write_values = values.copy()
+            if not should_write_date:
+                write_values["date"] = ""
+            self._write_case_values(sheet, insert_row, write_values)
             workbook.save(path)
         finally:
             workbook.close()
