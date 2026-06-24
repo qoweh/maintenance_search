@@ -160,6 +160,12 @@ def safe_cell(value: object) -> str:
     return normalize_text(value)
 
 
+def get_app_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
 def is_checked(value: str) -> bool:
     return normalize_text(value).strip().upper() in CHECKED_VALUES
 
@@ -888,7 +894,7 @@ class MaintenanceSearchApp:
         self.month_values: list[str] = []
         self._build_busy = False
 
-        self.folder_var = tk.StringVar(value=str(Path.cwd() / "유지보수내역서 25.01~26.04"))
+        self.folder_var = tk.StringVar(value=str(get_app_dir()))
         self.query_var = tk.StringVar()
         self.top_n_var = tk.IntVar(value=20)
         self.year_from_var = tk.StringVar(value="전체")
