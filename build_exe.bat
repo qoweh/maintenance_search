@@ -64,18 +64,7 @@ echo [3/4] PyInstaller 빌드 중...
 if not exist "dist" mkdir "dist"
 if exist "dist\%APP_NAME%.exe" del /f /q "dist\%APP_NAME%.exe"
 
-"%PYTHON_EXE%" -m PyInstaller ^
-    --noconfirm ^
-    --clean ^
-    --onefile ^
-    --windowed ^
-    --name "%APP_NAME%" ^
-    --distpath "%CD%\dist" ^
-    --workpath "%BUILD_WORK%" ^
-    --specpath "%SPEC_DIR%" ^
-    --hidden-import "win32com" ^
-    --hidden-import "win32com.client" ^
-    "app.py"
+"%PYTHON_EXE%" -m PyInstaller --noconfirm --clean --onefile --windowed --name "%APP_NAME%" --distpath "%CD%\dist" --workpath "%BUILD_WORK%" --specpath "%SPEC_DIR%" --hidden-import "win32com" --hidden-import "win32com.client" "app.py"
 if errorlevel 1 goto fail
 
 if not exist "dist\%APP_NAME%.exe" (
